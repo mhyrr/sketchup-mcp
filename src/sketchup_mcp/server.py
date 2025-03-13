@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.14"
+__version__ = "0.1.15"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -331,7 +331,7 @@ def transform_component(
         result = sketchup.send_command(
             method="tools/call",
             params={
-                "name": "transform",
+                "name": "transform_component",
                 "arguments": arguments
             },
             request_id=ctx.request_id
