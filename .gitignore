@@ -32,3 +32,4 @@ ENV/
 .DS_Store?
 ._*
 Thumbs.db
+*.tar.gz
