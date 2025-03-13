@@ -1,0 +1,35 @@
+[project]
+name = "sketchup-mcp"
+version = "0.1.5"
+description = "Sketchup integration through Model Context Protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "mcp[cli]>=1.3.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/sketchup-mcp"
+Issues = "https://github.com/yourusername/sketchup-mcp/issues"
+
+[project.scripts]
+sketchup-mcp = "sketchup_mcp.server:main"
+
+[project.entry-points.mcp]
+sketchup = "sketchup_mcp.server:mcp"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"} 

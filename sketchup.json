@@ -1,0 +1,134 @@
+{
+  "name": "sketchup",
+  "description": "Sketchup integration through Model Context Protocol",
+  "package": "sketchup-mcp",
+  "module": "sketchup_mcp.server",
+  "object": "mcp",
+  "tools": [
+    {
+      "name": "create_component",
+      "description": "Create a new component in Sketchup",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of component to create",
+            "default": "cube"
+          },
+          "position": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "Position [x,y,z] of the component",
+            "default": [0,0,0]
+          },
+          "dimensions": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "Dimensions [width,height,depth] of the component",
+            "default": [1,1,1]
+          }
+        }
+      }
+    },
+    {
+      "name": "delete_component",
+      "description": "Delete a component by ID",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ID of the component to delete"
+          }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "transform_component",
+      "description": "Transform a component's position, rotation, or scale",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ID of the component to transform"
+          },
+          "position": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "New position [x,y,z]"
+          },
+          "rotation": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "New rotation [x,y,z] in degrees"
+          },
+          "scale": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "description": "New scale [x,y,z]"
+          }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "get_selection",
+      "description": "Get currently selected components",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "set_material",
+      "description": "Set material for a component",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ID of the component"
+          },
+          "material": {
+            "type": "string",
+            "description": "Name of the material to apply"
+          }
+        },
+        "required": ["id", "material"]
+      }
+    },
+    {
+      "name": "export_scene",
+      "description": "Export the current scene",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "description": "Export format (e.g. skp, obj, etc)",
+            "default": "skp"
+          }
+        }
+      }
+    }
+  ],
+  "mcpServers": {
+    "sketchup": {
+      "command": "uvx",
+      "args": ["sketchup_mcp"]
+    }
+  }
+} 
