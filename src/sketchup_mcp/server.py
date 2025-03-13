@@ -12,6 +12,10 @@ logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SketchupMCPServer")
 
+# Define version directly to avoid pkg_resources dependency
+__version__ = "0.1.14"
+logger.info(f"SketchupMCP Server version {__version__} starting up")
+
 @dataclass
 class SketchupConnection:
     host: str
@@ -21,7 +25,15 @@ class SketchupConnection:
     def connect(self) -> bool:
         """Connect to the Sketchup extension socket server"""
         if self.sock:
-            return True
+            try:
+                # Test if connection is still alive
+                self.sock.settimeout(0.1)
+                self.sock.send(b'')
+                return True
+            except (socket.error, BrokenPipeError, ConnectionResetError):
+                # Connection is dead, close it and reconnect
+                logger.info("Connection test failed, reconnecting...")
+                self.disconnect()
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -89,52 +101,93 @@ class SketchupConnection:
         else:
             raise Exception("No data received")
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Sketchup and return the response"""
-        if not self.sock and not self.connect():
+    def send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
+        """Send a JSON-RPC request to Sketchup and return the response"""
+        # Try to connect if not connected
+        if not self.connect():
             raise ConnectionError("Not connected to Sketchup")
         
-        command = {
-            "command": command_type,
-            "parameters": params or {}
-        }
+        # Ensure we're sending a proper JSON-RPC request
+        if method == "tools/call" and params and "name" in params and "arguments" in params:
+            # This is already in the correct format
+            request = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": request_id
+            }
+        else:
+            # This is a direct command - convert to JSON-RPC
+            command_name = method
+            command_params = params or {}
+            
+            # Log the conversion
+            logger.info(f"Converting direct command '{command_name}' to JSON-RPC format")
+            
+            request = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": command_name,
+                    "arguments": command_params
+                },
+                "id": request_id
+            }
         
-        try:
-            logger.info(f"Sending command: {command_type} with params: {params}")
+        # Maximum number of retries
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                logger.info(f"Sending JSON-RPC request: {request}")
+                
+                # Log the exact bytes being sent
+                request_bytes = json.dumps(request).encode('utf-8') + b'\n'
+                logger.info(f"Raw bytes being sent: {request_bytes}")
+                
+                self.sock.sendall(request_bytes)
+                logger.info(f"Request sent, waiting for response...")
+                
+                self.sock.settimeout(15.0)
+                
+                response_data = self.receive_full_response(self.sock)
+                logger.info(f"Received {len(response_data)} bytes of data")
+                
+                response = json.loads(response_data.decode('utf-8'))
+                logger.info(f"Response parsed: {response}")
+                
+                if "error" in response:
+                    logger.error(f"Sketchup error: {response['error']}")
+                    raise Exception(response["error"].get("message", "Unknown error from Sketchup"))
+                
+                return response.get("result", {})
+                
+            except (socket.timeout, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                logger.warning(f"Connection error (attempt {retry_count+1}/{max_retries+1}): {str(e)}")
+                retry_count += 1
+                
+                if retry_count <= max_retries:
+                    logger.info(f"Retrying connection...")
+                    self.disconnect()
+                    if not self.connect():
+                        logger.error("Failed to reconnect")
+                        break
+                else:
+                    logger.error(f"Max retries reached, giving up")
+                    self.sock = None
+                    raise Exception(f"Connection to Sketchup lost after {max_retries+1} attempts: {str(e)}")
             
-            self.sock.sendall(json.dumps(command).encode('utf-8') + b'\n')
-            logger.info(f"Command sent, waiting for response...")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON response from Sketchup: {str(e)}")
+                if 'response_data' in locals() and response_data:
+                    logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
+                raise Exception(f"Invalid response from Sketchup: {str(e)}")
             
-            self.sock.settimeout(15.0)
-            
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, success: {response.get('success', False)}")
-            
-            if not response.get("success", False):
-                logger.error(f"Sketchup error: {response.get('error')}")
-                raise Exception(response.get("error", "Unknown error from Sketchup"))
-            
-            return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Sketchup")
-            self.sock = None
-            raise Exception("Timeout waiting for Sketchup response - try simplifying your request")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Sketchup lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Sketchup: {str(e)}")
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            raise Exception(f"Invalid response from Sketchup: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Sketchup: {str(e)}")
-            self.sock = None
-            raise Exception(f"Communication error with Sketchup: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error communicating with Sketchup: {str(e)}")
+                self.sock = None
+                raise Exception(f"Communication error with Sketchup: {str(e)}")
 
 # Global connection management
 _sketchup_connection = None
@@ -146,8 +199,13 @@ def get_sketchup_connection():
     if _sketchup_connection is not None:
         try:
             # Test connection with a ping command
-            ping_cmd = json.dumps({"command": "ping", "parameters": {}}).encode('utf-8') + b'\n'
-            _sketchup_connection.sock.sendall(ping_cmd)
+            ping_request = {
+                "jsonrpc": "2.0",
+                "method": "ping",
+                "params": {},
+                "id": 0
+            }
+            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
             return _sketchup_connection
         except Exception as e:
             logger.warning(f"Existing connection is no longer valid: {str(e)}")
@@ -204,14 +262,31 @@ def create_component(
 ) -> str:
     """Create a new component in Sketchup"""
     try:
+        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, request_id={ctx.request_id}")
+        
         sketchup = get_sketchup_connection()
-        result = sketchup.send_command("create_component", {
-            "type": type,
-            "position": position or [0,0,0],
-            "dimensions": dimensions or [1,1,1]
-        })
+        
+        params = {
+            "name": "create_component",
+            "arguments": {
+                "type": type,
+                "position": position or [0,0,0],
+                "dimensions": dimensions or [1,1,1]
+            }
+        }
+        
+        logger.info(f"Calling send_command with method='tools/call', params={params}, request_id={ctx.request_id}")
+        
+        result = sketchup.send_command(
+            method="tools/call",
+            params=params,
+            request_id=ctx.request_id
+        )
+        
+        logger.info(f"create_component result: {result}")
         return json.dumps(result)
     except Exception as e:
+        logger.error(f"Error in create_component: {str(e)}")
         return f"Error creating component: {str(e)}"
 
 @mcp.tool()
@@ -222,9 +297,14 @@ def delete_component(
     """Delete a component by ID"""
     try:
         sketchup = get_sketchup_connection()
-        result = sketchup.send_command("delete_component", {
-            "id": id
-        })
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "delete_component",
+                "arguments": {"id": id}
+            },
+            request_id=ctx.request_id
+        )
         return json.dumps(result)
     except Exception as e:
         return f"Error deleting component: {str(e)}"
@@ -240,15 +320,22 @@ def transform_component(
     """Transform a component's position, rotation, or scale"""
     try:
         sketchup = get_sketchup_connection()
-        params = {"id": id}
+        arguments = {"id": id}
         if position is not None:
-            params["position"] = position
+            arguments["position"] = position
         if rotation is not None:
-            params["rotation"] = rotation
+            arguments["rotation"] = rotation
         if scale is not None:
-            params["scale"] = scale
+            arguments["scale"] = scale
             
-        result = sketchup.send_command("transform", params)
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "transform",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
         return json.dumps(result)
     except Exception as e:
         return f"Error transforming component: {str(e)}"
@@ -258,7 +345,14 @@ def get_selection(ctx: Context) -> str:
     """Get currently selected components"""
     try:
         sketchup = get_sketchup_connection()
-        result = sketchup.send_command("get_selection", {})
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_selection",
+                "arguments": {}
+            },
+            request_id=ctx.request_id
+        )
         return json.dumps(result)
     except Exception as e:
         return f"Error getting selection: {str(e)}"
@@ -272,10 +366,17 @@ def set_material(
     """Set material for a component"""
     try:
         sketchup = get_sketchup_connection()
-        result = sketchup.send_command("set_material", {
-            "id": id,
-            "material": material
-        })
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "set_material",
+                "arguments": {
+                    "id": id,
+                    "material": material
+                }
+            },
+            request_id=ctx.request_id
+        )
         return json.dumps(result)
     except Exception as e:
         return f"Error setting material: {str(e)}"
@@ -288,9 +389,16 @@ def export_scene(
     """Export the current scene"""
     try:
         sketchup = get_sketchup_connection()
-        result = sketchup.send_command("export", {
-            "format": format
-        })
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "export",
+                "arguments": {
+                    "format": format
+                }
+            },
+            request_id=ctx.request_id
+        )
         return json.dumps(result)
     except Exception as e:
         return f"Error exporting scene: {str(e)}"
