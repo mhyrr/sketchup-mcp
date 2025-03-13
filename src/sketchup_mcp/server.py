@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.15"
+__version__ = "0.1.16"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
