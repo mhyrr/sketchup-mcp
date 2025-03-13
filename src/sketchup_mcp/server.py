@@ -403,6 +403,138 @@ def export_scene(
     except Exception as e:
         return f"Error exporting scene: {str(e)}"
 
+@mcp.tool()
+def create_mortise_tenon(
+    ctx: Context,
+    mortise_id: str,
+    tenon_id: str,
+    width: float = 1.0,
+    height: float = 1.0,
+    depth: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    offset_z: float = 0.0
+) -> str:
+    """Create a mortise and tenon joint between two components"""
+    try:
+        logger.info(f"create_mortise_tenon called with mortise_id={mortise_id}, tenon_id={tenon_id}, width={width}, height={height}, depth={depth}, offsets=({offset_x}, {offset_y}, {offset_z})")
+        
+        sketchup = get_sketchup_connection()
+        
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "create_mortise_tenon",
+                "arguments": {
+                    "mortise_id": mortise_id,
+                    "tenon_id": tenon_id,
+                    "width": width,
+                    "height": height,
+                    "depth": depth,
+                    "offset_x": offset_x,
+                    "offset_y": offset_y,
+                    "offset_z": offset_z
+                }
+            },
+            request_id=ctx.request_id
+        )
+        
+        logger.info(f"create_mortise_tenon result: {result}")
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error in create_mortise_tenon: {str(e)}")
+        return f"Error creating mortise and tenon joint: {str(e)}"
+
+@mcp.tool()
+def create_dovetail(
+    ctx: Context,
+    tail_id: str,
+    pin_id: str,
+    width: float = 1.0,
+    height: float = 1.0,
+    depth: float = 1.0,
+    angle: float = 15.0,
+    num_tails: int = 3,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    offset_z: float = 0.0
+) -> str:
+    """Create a dovetail joint between two components"""
+    try:
+        logger.info(f"create_dovetail called with tail_id={tail_id}, pin_id={pin_id}, width={width}, height={height}, depth={depth}, angle={angle}, num_tails={num_tails}")
+        
+        sketchup = get_sketchup_connection()
+        
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "create_dovetail",
+                "arguments": {
+                    "tail_id": tail_id,
+                    "pin_id": pin_id,
+                    "width": width,
+                    "height": height,
+                    "depth": depth,
+                    "angle": angle,
+                    "num_tails": num_tails,
+                    "offset_x": offset_x,
+                    "offset_y": offset_y,
+                    "offset_z": offset_z
+                }
+            },
+            request_id=ctx.request_id
+        )
+        
+        logger.info(f"create_dovetail result: {result}")
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error in create_dovetail: {str(e)}")
+        return f"Error creating dovetail joint: {str(e)}"
+
+@mcp.tool()
+def create_finger_joint(
+    ctx: Context,
+    board1_id: str,
+    board2_id: str,
+    width: float = 1.0,
+    height: float = 1.0,
+    depth: float = 1.0,
+    num_fingers: int = 5,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    offset_z: float = 0.0
+) -> str:
+    """Create a finger joint (box joint) between two components"""
+    try:
+        logger.info(f"create_finger_joint called with board1_id={board1_id}, board2_id={board2_id}, width={width}, height={height}, depth={depth}, num_fingers={num_fingers}")
+        
+        sketchup = get_sketchup_connection()
+        
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "create_finger_joint",
+                "arguments": {
+                    "board1_id": board1_id,
+                    "board2_id": board2_id,
+                    "width": width,
+                    "height": height,
+                    "depth": depth,
+                    "num_fingers": num_fingers,
+                    "offset_x": offset_x,
+                    "offset_y": offset_y,
+                    "offset_z": offset_z
+                }
+            },
+            request_id=ctx.request_id
+        )
+        
+        logger.info(f"create_finger_joint result: {result}")
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error in create_finger_joint: {str(e)}")
+        return f"Error creating finger joint: {str(e)}"
+
 def main():
     mcp.run()
 
