@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -534,6 +534,44 @@ def create_finger_joint(
     except Exception as e:
         logger.error(f"Error in create_finger_joint: {str(e)}")
         return f"Error creating finger joint: {str(e)}"
+
+@mcp.tool()
+def eval_ruby(
+    ctx: Context,
+    code: str
+) -> str:
+    """Evaluate arbitrary Ruby code in Sketchup"""
+    try:
+        logger.info(f"eval_ruby called with code length: {len(code)}")
+        
+        sketchup = get_sketchup_connection()
+        
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "eval_ruby",
+                "arguments": {
+                    "code": code
+                }
+            },
+            request_id=ctx.request_id
+        )
+        
+        logger.info(f"eval_ruby result: {result}")
+        
+        # Format the response to include the result
+        response = {
+            "success": True,
+            "result": result.get("content", [{"text": "Success"}])[0].get("text", "Success") if isinstance(result.get("content"), list) and len(result.get("content", [])) > 0 else "Success"
+        }
+        
+        return json.dumps(response)
+    except Exception as e:
+        logger.error(f"Error in eval_ruby: {str(e)}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 def main():
     mcp.run()

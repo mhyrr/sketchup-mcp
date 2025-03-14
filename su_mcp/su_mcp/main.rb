@@ -242,6 +242,8 @@ module SU_MCP
           create_dovetail(args)
         when "create_finger_joint"
           create_finger_joint(args)
+        when "eval_ruby"
+          eval_ruby(args)
         else
           raise "Unknown tool: #{tool_name}"
         end
@@ -251,7 +253,7 @@ module SU_MCP
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: {
-              content: [{ type: "text", text: "Success" }],
+              content: [{ type: "text", text: result[:result] || "Success" }],
               isError: false,
               success: true,
               resourceId: result[:id]
@@ -1819,6 +1821,30 @@ module SU_MCP
         success: true, 
         id: board.entityID
       }
+    end
+    
+    def eval_ruby(params)
+      log "Evaluating Ruby code with length: #{params['code'].length}"
+      
+      begin
+        # Create a safe binding for evaluation
+        binding = TOPLEVEL_BINDING.dup
+        
+        # Evaluate the Ruby code
+        log "Starting code evaluation..."
+        result = eval(params["code"], binding)
+        log "Code evaluation completed with result: #{result.inspect}"
+        
+        # Return success with the result as a string
+        { 
+          success: true,
+          result: result.to_s
+        }
+      rescue StandardError => e
+        log "Error in eval_ruby: #{e.message}"
+        log e.backtrace.join("\n")
+        raise "Ruby evaluation error: #{e.message}"
+      end
     end
   end
 

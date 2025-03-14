@@ -11,6 +11,7 @@ Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the i
 * **Material control**: Apply and modify materials and colors
 * **Scene inspection**: Get detailed information about the current Sketchup scene
 * **Selection handling**: Get and manipulate selected components
+* **Ruby code evaluation**: Execute arbitrary Ruby code directly in SketchUp for advanced operations
 
 ## Components
 
@@ -68,6 +69,7 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 * `transform_component` - Move, rotate, or scale a component
 * `set_material` - Apply materials to components
 * `export_scene` - Export the current scene to various formats
+* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
 
 ### Example Commands
 
@@ -78,6 +80,7 @@ Here are some examples of what you can ask Claude to do:
 * "Make the selected component red"
 * "Move the selected component 10 units up"
 * "Export the current scene as a 3D model"
+* "Create a complex arts and crafts cabinet using Ruby code"
 
 ## Troubleshooting
 
