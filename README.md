@@ -1,4 +1,5 @@
 # SketchupMCP - Sketchup Model Context Protocol Integration
+[![smithery badge](https://smithery.ai/badge/@mhyrr/sketchup-mcp)](https://smithery.ai/server/@mhyrr/sketchup-mcp)
 
 SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
 
@@ -25,6 +26,14 @@ The system consists of two main components:
 ### Python Packaging
 
 We're using uv so you'll need to ```brew install uv```
+
+### Installing via Smithery
+
+To install Sketchup Integration for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@mhyrr/sketchup-mcp):
+
+```bash
+npx -y @smithery/cli install @mhyrr/sketchup-mcp --client claude
+```
 
 ### Sketchup Extension
 
