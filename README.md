@@ -4,6 +4,10 @@ SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (M
 
 Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
 
+<a href="https://glama.ai/mcp/servers/@mhyrr/sketchup-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@mhyrr/sketchup-mcp/badge" alt="SketchupMCP MCP server" />
+</a>
+
 ## Features
 
 * **Two-way communication**: Connect Claude AI to Sketchup through a TCP socket connection
@@ -103,4 +107,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT 
+MIT
