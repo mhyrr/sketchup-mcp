@@ -16,7 +16,7 @@ FileUtils.mkdir_p(temp_dir)
 # Copy files to temp directory
 FileUtils.cp_r('su_mcp', temp_dir)
 FileUtils.cp('su_mcp.rb', temp_dir)
-FileUtils.cp('extension.json', temp_dir)
+FileUtils.cp('su_mcp/extension.json', temp_dir)
 
 # Create zip file
 FileUtils.rm(OUTPUT_NAME) if File.exist?(OUTPUT_NAME)
