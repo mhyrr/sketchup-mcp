@@ -20,26 +20,46 @@ The system consists of two main components:
 1. **Sketchup Extension**: A Sketchup extension that creates a TCP server within Sketchup to receive and execute commands
 2. **MCP Server (`sketchup_mcp/server.py`)**: A Python server that implements the Model Context Protocol and connects to the Sketchup extension
 
-## Installation
+## Installation and Usage
 
-### Python Packaging
+### 1. Setup Python Environment
+*   Make sure you have `uv` installed. If not, you can usually install it with `brew install uv` on macOS or `pip install uv` on other systems.
+*   Create a virtual environment in the project root:
+    ```bash
+    uv venv
+    ```
+*   Install the required Python dependencies:
+    ```bash
+    uv pip install -r requirements.txt
+    ```
 
-We're using uv so you'll need to ```brew install uv```
+### 2. Setup Ruby Environment (for packaging the extension)
+*   You'll need Ruby to package the Sketchup extension. On Debian-based systems (like Ubuntu), you can install it with:
+    ```bash
+    sudo apt-get update
+    sudo apt-get install -y ruby-full
+    ```
+*   You also need the `rubyzip` gem:
+    ```bash
+    sudo gem install rubyzip
+    ```
 
-### Sketchup Extension
+### 3. Package the Sketchup Extension
+*   Run the packaging script from the project root:
+    ```bash
+    ruby su_mcp/package.rb
+    ```
+*   This will create a file named `su_mcp_v1.6.0.rbz` in the project's root directory.
 
-1. Download or build the latest `.rbz` file
-2. In Sketchup, go to Window > Extension Manager
-3. Click "Install Extension" and select the downloaded `.rbz` file
-4. Restart Sketchup
+### 4. Install and Run
+1.  **Install the extension in Sketchup:** Open Sketchup, go to `Window > Extension Manager`, click "Install Extension", and select the `su_mcp_v1.6.0.rbz` file you just created.
+2.  **Start the Python MCP server:** In your terminal (from the project root), run:
+    ```bash
+    uv run sketchup-mcp
+    ```
+3.  **Start the server in Sketchup:** In Sketchup, go to the menu `Plugins > MCP Server > Start Server`.
 
-## Usage
-
-### Starting the Connection
-
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
-2. The server will start on the default port (9876)
-3. Make sure the MCP server is running in your terminal
+The Python server and the Sketchup extension should now be connected and ready to receive commands.
 
 ### Using with Claude
 
