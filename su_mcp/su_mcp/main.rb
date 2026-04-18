@@ -2,146 +2,311 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'timeout'
+require 'logger'
+require 'tmpdir'
 
 puts "MCP Extension loading..."
-SKETCHUP_CONSOLE.show rescue nil
 
 module SU_MCP
+  # JSON-RPC 2.0 error codes (canonical + custom -320xx range)
+  ERR_PARSE         = -32700
+  ERR_INVALID_REQ   = -32600
+  ERR_METHOD        = -32601
+  ERR_INVALID_PARAM = -32602
+  ERR_INTERNAL      = -32603
+  ERR_TRANSPORT     = -32000
+  ERR_TIMEOUT       = -32001
+  ERR_RUBY_EXC      = -32002
+
+  # Log levels
+  LOG_DEBUG = 0
+  LOG_INFO  = 1
+  LOG_WARN  = 2
+  LOG_ERROR = 3
+  LOG_NAMES = { LOG_DEBUG => "DEBUG", LOG_INFO => "INFO", LOG_WARN => "WARN", LOG_ERROR => "ERROR" }
+
   class Server
-    def initialize
-      @port = 9876
-      @server = nil
-      @running = false
-      @timer_id = nil
-      
-      # Try multiple ways to show console
-      begin
-        SKETCHUP_CONSOLE.show
-      rescue
+    DEFAULT_PORT          = 9876
+    DEFAULT_TIMEOUT       = 60      # seconds, per request
+    DEFAULT_EVAL_TIMEOUT  = 30      # seconds, per eval_ruby call
+    POLL_INTERVAL         = 0.05    # seconds between select() polls
+    READ_CHUNK            = 16384   # bytes per non-blocking read
+    MAX_REQUEST_BYTES     = 8 * 1024 * 1024  # 8 MB hard cap
+
+    VERSION = "2.0.0"
+
+    def initialize(port: nil)
+      @port        = (port || ENV['SKETCHUP_MCP_PORT'] || DEFAULT_PORT).to_i
+      @server      = nil
+      @running     = false
+      @timer_id    = nil
+      @clients     = []   # array of {sock:, buffer:, id: }
+      @next_cid    = 1
+      @log_level   = parse_log_level(ENV['SKETCHUP_MCP_LOG_LEVEL'] || 'INFO')
+      @log_to_file = ENV['SKETCHUP_MCP_LOG_FILE']  # path, optional
+      @verbose_console = ENV['SKETCHUP_MCP_VERBOSE_CONSOLE'] == '1'
+      @request_timeout  = (ENV['SKETCHUP_MCP_TIMEOUT']      || DEFAULT_TIMEOUT).to_i
+      @eval_timeout     = (ENV['SKETCHUP_MCP_EVAL_TIMEOUT'] || DEFAULT_EVAL_TIMEOUT).to_i
+
+      SKETCHUP_CONSOLE.show rescue nil
+    end
+
+    def parse_log_level(str)
+      case str.to_s.upcase
+      when 'DEBUG' then LOG_DEBUG
+      when 'INFO'  then LOG_INFO
+      when 'WARN'  then LOG_WARN
+      when 'ERROR' then LOG_ERROR
+      else LOG_INFO
+      end
+    end
+
+    # Leveled logger. Writes to console only if WARN+ or @verbose_console set.
+    # Always appends to file if @log_to_file set.
+    # Dual signature:
+    #   log(level_int, msg_string)  — preferred
+    #   log(msg_string)             — legacy, treated as DEBUG
+    def log(level_or_msg, msg = nil)
+      if msg.nil?
+        level = LOG_DEBUG
+        text = level_or_msg.to_s
+      else
+        level = level_or_msg
+        text = msg.to_s
+      end
+      return if level < @log_level
+      line = "[#{Time.now.strftime('%H:%M:%S')}] MCP #{LOG_NAMES[level]}: #{text}"
+      if @verbose_console || level >= LOG_WARN
         begin
-          Sketchup.send_action("showRubyPanel:")
+          SKETCHUP_CONSOLE.write(line + "\n")
         rescue
-          UI.start_timer(0) { SKETCHUP_CONSOLE.show }
+          puts line
+        end
+      end
+      if @log_to_file
+        begin
+          File.open(@log_to_file, 'a') { |f| f.puts line }
+        rescue
+          # best effort
         end
       end
     end
 
-    def log(msg)
-      begin
-        SKETCHUP_CONSOLE.write("MCP: #{msg}\n")
-      rescue
-        puts "MCP: #{msg}"
-      end
-      STDOUT.flush
-    end
+    def debug(m); log(LOG_DEBUG, m); end
+    def info(m);  log(LOG_INFO, m);  end
+    def warn(m);  log(LOG_WARN, m);  end
+    def error(m); log(LOG_ERROR, m); end
 
     def start
       return if @running
-      
+
       begin
-        log "Starting server on localhost:#{@port}..."
-        
+        info "Starting server v#{VERSION} on localhost:#{@port}"
         @server = TCPServer.new('127.0.0.1', @port)
-        log "Server created on port #{@port}"
-        
         @running = true
-        
-        @timer_id = UI.start_timer(0.1, true) {
-          begin
-            if @running
-              # Check for connection
-              ready = IO.select([@server], nil, nil, 0)
-              if ready
-                log "Connection waiting..."
-                client = @server.accept_nonblock
-                log "Client accepted"
-                
-                data = client.gets
-                log "Raw data: #{data.inspect}"
-                
-                if data
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  end
-                end
-                
-                client.close
-                log "Client closed"
-              end
-            end
-          rescue IO::WaitReadable
-            # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
-          end
-        }
-        
-        log "Server started and listening"
-        
+
+        @timer_id = UI.start_timer(POLL_INTERVAL, true) { tick }
+        info "Server listening on port #{@port} (timeout=#{@request_timeout}s, eval_timeout=#{@eval_timeout}s, log_level=#{LOG_NAMES[@log_level]})"
       rescue StandardError => e
-        log "Error: #{e.message}"
-        log e.backtrace.join("\n")
+        error "Startup failed: #{e.message}"
+        error e.backtrace.first(5).join("\n")
         stop
       end
     end
 
     def stop
-      log "Stopping server..."
+      info "Stopping server"
       @running = false
-      
-      if @timer_id
-        UI.stop_timer(@timer_id)
-        @timer_id = nil
+
+      UI.stop_timer(@timer_id) if @timer_id
+      @timer_id = nil
+
+      @clients.each do |c|
+        begin c[:sock].close rescue nil end
       end
-      
-      @server.close if @server
+      @clients.clear
+
+      @server.close rescue nil
       @server = nil
-      log "Server stopped"
+      info "Server stopped"
+    end
+
+    # Single tick of the UI timer: accept new connections, drain existing ones.
+    def tick
+      return unless @running
+      accept_new_connections
+      service_clients
+    rescue StandardError => e
+      error "tick error: #{e.message}"
+      error e.backtrace.first(5).join("\n")
+    end
+
+    def accept_new_connections
+      loop do
+        ready = IO.select([@server], nil, nil, 0)
+        break unless ready
+        begin
+          sock = @server.accept_nonblock
+          cid = @next_cid
+          @next_cid += 1
+          @clients << { sock: sock, buffer: String.new(encoding: 'BINARY'), id: cid }
+          debug "Client ##{cid} connected"
+        rescue IO::WaitReadable, Errno::EAGAIN
+          break
+        end
+      end
+    end
+
+    def service_clients
+      @clients.reject! do |c|
+        begin
+          drain_client(c)
+          false  # keep
+        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
+          debug "Client ##{c[:id]} disconnected"
+          begin c[:sock].close rescue nil end
+          true   # drop
+        rescue StandardError => e
+          error "Client ##{c[:id]} error: #{e.message}"
+          begin c[:sock].close rescue nil end
+          true
+        end
+      end
+    end
+
+    # Read any pending bytes on the client socket, try to parse as many
+    # JSON messages as possible, dispatch each one, and write responses.
+    # Supports two framing modes:
+    #   1. Concatenated JSON (accumulate buffer, try parse, on success consume prefix)
+    #   2. Newline-delimited JSON (back-compat with v0.1.x clients)
+    def drain_client(client)
+      sock = client[:sock]
+
+      loop do
+        begin
+          chunk = sock.read_nonblock(READ_CHUNK)
+          if chunk.nil? || chunk.empty?
+            raise EOFError
+          end
+          client[:buffer] << chunk
+        rescue IO::WaitReadable, Errno::EAGAIN
+          break  # no more data for now
+        end
+
+        if client[:buffer].bytesize > MAX_REQUEST_BYTES
+          send_error(sock, nil, ERR_INVALID_REQ, "Request exceeds #{MAX_REQUEST_BYTES} bytes")
+          client[:buffer].clear
+          raise EOFError
+        end
+      end
+
+      # Extract and dispatch all complete messages in buffer
+      loop do
+        break if client[:buffer].empty?
+        request, consumed = try_parse_json_prefix(client[:buffer])
+        break unless request  # need more data
+        client[:buffer] = client[:buffer].byteslice(consumed, client[:buffer].bytesize - consumed) || String.new(encoding: 'BINARY')
+        handle_and_respond(sock, request)
+      end
+    end
+
+    # Try to parse a JSON object from the start of +buffer+.
+    # Returns [parsed_hash, bytes_consumed] or [nil, 0] if incomplete/invalid.
+    # Tolerates trailing whitespace/newlines between messages.
+    def try_parse_json_prefix(buffer)
+      text = buffer.dup.force_encoding('UTF-8')
+      text.lstrip!
+      return [nil, 0] if text.empty?
+
+      # Fast path: newline-delimited
+      if idx = text.index("\n")
+        line = text[0..idx].strip
+        if !line.empty?
+          begin
+            parsed = JSON.parse(line)
+            consumed = buffer.bytesize - (text.bytesize - (idx + 1))
+            return [parsed, consumed]
+          rescue JSON::ParserError
+            # fall through to incremental parse
+          end
+        end
+      end
+
+      # Slow path: incremental object parse
+      depth = 0
+      in_string = false
+      escape = false
+      text.each_char.with_index do |ch, i|
+        if in_string
+          if escape
+            escape = false
+          elsif ch == '\\'
+            escape = true
+          elsif ch == '"'
+            in_string = false
+          end
+          next
+        end
+        case ch
+        when '"' then in_string = true
+        when '{' then depth += 1
+        when '}' then
+          depth -= 1
+          if depth == 0
+            candidate = text[0..i]
+            begin
+              parsed = JSON.parse(candidate)
+              consumed = buffer.bytesize - (text.bytesize - (i + 1))
+              return [parsed, consumed]
+            rescue JSON::ParserError
+              return [nil, 0]  # malformed — wait for more or treat as framing error
+            end
+          end
+        end
+      end
+      [nil, 0]
+    end
+
+    def handle_and_respond(sock, request)
+      req_id = request.is_a?(Hash) ? request["id"] : nil
+      begin
+        response = Timeout::timeout(@request_timeout) { handle_jsonrpc_request(request) }
+        send_response(sock, response)
+      rescue Timeout::Error
+        warn "Request timeout (>#{@request_timeout}s)"
+        send_error(sock, req_id, ERR_TIMEOUT, "Request timed out after #{@request_timeout}s")
+      rescue StandardError => e
+        error "Handler error: #{e.class}: #{e.message}"
+        error e.backtrace.first(5).join("\n")
+        send_error(sock, req_id, ERR_INTERNAL, e.message, backtrace: e.backtrace.first(5))
+      end
+    end
+
+    def send_response(sock, response)
+      body = response.to_json + "\n"
+      sock.write(body)
+      sock.flush
+      debug "Sent #{body.bytesize} byte response"
+    end
+
+    def send_error(sock, id, code, message, data: nil, backtrace: nil)
+      payload = {
+        jsonrpc: "2.0",
+        error: { code: code, message: message }.tap { |h|
+          extra = {}
+          extra[:backtrace] = backtrace if backtrace
+          extra.merge!(data) if data.is_a?(Hash)
+          h[:data] = extra unless extra.empty?
+        },
+        id: id
+      }
+      begin
+        sock.write(payload.to_json + "\n")
+        sock.flush
+      rescue StandardError => e
+        error "Failed to send error response: #{e.message}"
+      end
     end
 
     private
@@ -244,45 +409,74 @@ module SU_MCP
           create_finger_joint(args)
         when "eval_ruby"
           eval_ruby(args)
+        when "batch"
+          batch(args)
+        when "undo_last"
+          undo_last(args)
+        when "measure"
+          measure(args)
+        when "snapshot"
+          snapshot(args)
+        when "list_definitions"
+          list_definitions(args)
+        when "list_instances"
+          list_instances(args)
+        when "select"
+          select_entities(args)
+        when "units_info"
+          units_info(args)
+        when "transaction"
+          transaction(args)
+        when "ping"
+          { success: true, result: { pong: true, version: VERSION, time: Time.now.to_f } }
         else
           raise "Unknown tool: #{tool_name}"
         end
 
-        log "Tool call result: #{result.inspect}"
+        debug "Tool call result: #{result.inspect[0, 500]}"
         if result[:success]
+          # Serialize payload appropriately:
+          # - Hash payloads (e.g. new eval_ruby) → JSON text
+          # - Scalars → to_s
+          payload_text = case result[:result]
+                        when nil  then "Success"
+                        when Hash, Array then result[:result].to_json
+                        else result[:result].to_s
+                        end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: {
-              content: [{ type: "text", text: result[:result] || "Success" }],
+              content: [{ type: "text", text: payload_text }],
               isError: false,
               success: true,
-              resourceId: result[:id]
-            },
+              resourceId: result[:id],
+              structured: result[:result].is_a?(Hash) ? result[:result] : nil
+            }.compact,
             id: request["id"]
           }
-          log "Sending success response: #{response.inspect}"
+          debug "Sending success response (#{payload_text.bytesize} bytes)"
           response
         else
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
-            error: { 
-              code: -32603, 
-              message: "Operation failed",
+            error: {
+              code: ERR_INTERNAL,
+              message: result[:error] || "Operation failed",
               data: { success: false }
             },
             id: request["id"]
           }
-          log "Sending error response: #{response.inspect}"
+          debug "Sending error response (operation-failed)"
           response
         end
       rescue StandardError => e
-        log "Tool call error: #{e.message}"
+        error "Tool call error: #{e.class}: #{e.message}"
         response = {
           jsonrpc: request["jsonrpc"] || "2.0",
-          error: { 
-            code: -32603, 
+          error: {
+            code: ERR_RUBY_EXC,
             message: e.message,
-            data: { success: false }
+            data: { success: false, backtrace: e.backtrace.first(5) }
           },
           id: request["id"]
         }
@@ -1823,26 +2017,357 @@ module SU_MCP
       }
     end
     
-    def eval_ruby(params)
-      log "Evaluating Ruby code with length: #{params['code'].length}"
-      
-      begin
-        # Create a safe binding for evaluation
-        binding = TOPLEVEL_BINDING.dup
-        
-        # Evaluate the Ruby code
-        log "Starting code evaluation..."
-        result = eval(params["code"], binding)
-        log "Code evaluation completed with result: #{result.inspect}"
-        
-        # Return success with the result as a string
-        { 
-          success: true,
-          result: result.to_s
+    # ──────────────────────────────────────────────────────────────────
+    # Phase B: batch & undo_last
+    # ──────────────────────────────────────────────────────────────────
+
+    # batch({ "calls": [{"tool": "eval_ruby", "args": {...}}, ...],
+    #         "wrap_undo": true, "undo_name": "MCP batch", "stop_on_error": true })
+    # Runs each sub-call inside ONE model.start_operation / commit_operation,
+    # returning an array of per-call results. Any call that raises either
+    # aborts the whole batch (stop_on_error) or is recorded as an error
+    # entry and the batch continues.
+    def batch(params)
+      calls = Array(params["calls"])
+      wrap_undo     = params["wrap_undo"] != false  # default true
+      undo_name     = params["undo_name"] || "MCP batch"
+      stop_on_error = params["stop_on_error"] != false
+
+      results = []
+      model = Sketchup.active_model
+
+      runner = lambda do
+        calls.each_with_index do |call, i|
+          begin
+            tool_name = call["tool"] || call[:tool]
+            args      = call["args"] || call[:args] || {}
+            sub_req = {
+              "jsonrpc" => "2.0",
+              "method"  => "tools/call",
+              "params"  => { "name" => tool_name, "arguments" => args },
+              "id"      => "batch-#{i}"
+            }
+            resp = handle_tool_call(sub_req)
+            if resp[:error] || resp["error"]
+              err = resp[:error] || resp["error"]
+              msg = err[:message] || err["message"]
+              results << { index: i, success: false, error: msg }
+              raise "batch[#{i}] failed: #{msg}" if stop_on_error
+            else
+              payload = resp[:result] || resp["result"]
+              results << { index: i, success: true, result: payload }
+            end
+          rescue StandardError => e
+            results << { index: i, success: false, error: e.message }
+            raise if stop_on_error
+          end
+        end
+      end
+
+      if wrap_undo && model
+        model.start_operation(undo_name, true)
+        begin
+          runner.call
+          model.commit_operation
+        rescue StandardError => e
+          model.abort_operation rescue nil
+          return { success: false, error: e.message, result: { completed: results.size, results: results } }
+        end
+      else
+        runner.call
+      end
+
+      { success: true, result: { count: results.size, results: results } }
+    end
+
+    # undo_last({ "steps": 1 }) — undo N operations in active model
+    def undo_last(params)
+      steps = (params && params["steps"] || 1).to_i
+      steps = 1 if steps < 1
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      undone = 0
+      steps.times do
+        begin
+          model.undo_operation
+          undone += 1
+        rescue StandardError
+          break
+        end
+      end
+      { success: true, result: { undone: undone, requested: steps } }
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase C: new capability tools
+    # ──────────────────────────────────────────────────────────────────
+
+    # measure({ "id": 12345 }) — bounds + position + material + class
+    def measure(params)
+      entity_id = (params["id"] || params["entity_id"]).to_i
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      entity = model.find_entity_by_id(entity_id)
+      raise "No entity with id=#{entity_id}" unless entity
+
+      data = {
+        id: entity_id,
+        class: entity.class.name,
+        valid: entity.valid?
+      }
+      if entity.respond_to?(:bounds)
+        bb = entity.bounds
+        data[:bounds_cm] = {
+          min: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          max: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+          size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
         }
+      end
+      if entity.respond_to?(:transformation)
+        o = entity.transformation.origin
+        data[:position_cm] = o.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+      end
+      if entity.respond_to?(:material) && entity.material
+        data[:material] = { name: entity.material.display_name, color: entity.material.color.to_a }
+      end
+      if entity.is_a?(Sketchup::ComponentInstance)
+        data[:definition] = entity.definition.name
+      elsif entity.is_a?(Sketchup::Group)
+        data[:group_name] = entity.name
+      end
+      { success: true, result: data }
+    end
+
+    # snapshot({ "width": 1600, "height": 1000, "camera": {...optional...}, "antialias": true })
+    # Renders the current view to a temp PNG and returns the absolute path
+    # plus width/height. Base64 encoding skipped by default (large payload).
+    def snapshot(params)
+      params ||= {}
+      width  = (params["width"]  || 1600).to_i
+      height = (params["height"] || 1000).to_i
+      antialias = params["antialias"] != false
+      compression = (params["compression"] || 0.9).to_f
+      path = params["path"] || File.join(Dir.tmpdir, "sketchup_mcp_snapshot_#{Time.now.to_i}.png")
+
+      model = Sketchup.active_model
+      view = model.active_view
+
+      if params["camera"]
+        cam_p = params["camera"]
+        eye    = Geom::Point3d.new(*cam_p["eye"])    if cam_p["eye"]
+        target = Geom::Point3d.new(*cam_p["target"]) if cam_p["target"]
+        up_v   = Geom::Vector3d.new(*cam_p["up"])    if cam_p["up"]
+        persp  = cam_p.fetch("perspective", true)
+        fov    = cam_p["fov"] || 50.0
+        if eye && target && up_v
+          view.camera = Sketchup::Camera.new(eye, target, up_v, persp, fov)
+        end
+      end
+
+      view.write_image(path, width, height, antialias, compression)
+      { success: true, result: { path: path, width: width, height: height } }
+    end
+
+    # list_definitions({ "name_match": "Sofa", "include_bounds": true })
+    def list_definitions(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      match = params["name_match"]
+      include_bounds = params["include_bounds"] != false
+
+      results = model.definitions.map do |d|
+        entry = {
+          name: d.name,
+          guid: (d.guid rescue nil),
+          instance_count: d.count_instances,
+          is_component: d.is_a?(Sketchup::ComponentDefinition)
+        }
+        if include_bounds
+          bb = d.bounds
+          entry[:bounds_cm] = {
+            size: [bb.width, bb.height, bb.depth].map { |v| (v.to_f / 0.393700787).round(3) }
+          }
+        end
+        entry
+      end
+
+      if match && !match.empty?
+        rx = Regexp.new(match, Regexp::IGNORECASE)
+        results = results.select { |e| rx.match?(e[:name].to_s) }
+      end
+
+      { success: true, result: { count: results.size, definitions: results } }
+    end
+
+    # list_instances({ "definition_name": "Single Sofa", "limit": 200,
+    #                  "bounds": { "min": [x,y,z], "max": [x,y,z] } })
+    def list_instances(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      want_def = params["definition_name"]
+      limit = (params["limit"] || 500).to_i
+      bb_filter = params["bounds"]
+
+      collected = []
+      walker = lambda do |ents|
+        ents.each do |e|
+          break if collected.size >= limit
+          case e
+          when Sketchup::ComponentInstance
+            if !want_def || e.definition.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  definition: e.definition.name,
+                  position_cm: e.transformation.origin.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          when Sketchup::Group
+            if !want_def || e.name == want_def
+              bb = e.bounds
+              if pass_bb_filter?(bb, bb_filter)
+                collected << {
+                  id: e.entityID,
+                  group_name: e.name,
+                  bounds_min_cm: bb.min.to_a.map { |v| (v.to_f / 0.393700787).round(3) },
+                  bounds_max_cm: bb.max.to_a.map { |v| (v.to_f / 0.393700787).round(3) }
+                }
+              end
+            end
+          end
+        end
+      end
+      walker.call(model.entities)
+
+      { success: true, result: { count: collected.size, instances: collected, truncated: collected.size >= limit } }
+    end
+
+    def pass_bb_filter?(bb, filter)
+      return true unless filter
+      min = filter["min"]; max = filter["max"]
+      return true unless min && max
+      !(bb.max.x < min[0] || bb.min.x > max[0] ||
+        bb.max.y < min[1] || bb.min.y > max[1] ||
+        bb.max.z < min[2] || bb.min.z > max[2])
+    end
+
+    # select({ "ids": [1234, 5678] }) — replaces current selection
+    def select_entities(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      ids = Array(params["ids"]).map(&:to_i)
+      model.selection.clear
+      resolved = ids.map { |i| model.find_entity_by_id(i) }.compact
+      model.selection.add(resolved)
+      { success: true, result: { requested: ids.size, selected: resolved.size, missing: ids.size - resolved.size } }
+    end
+
+    # units_info — expose length unit + conversion factors so the client
+    # never has to guess inches vs cm.
+    def units_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      opts = model.options["UnitsOptions"]
+      names = { 0 => "inches", 1 => "feet", 2 => "mm", 3 => "cm", 4 => "m" }
+      {
+        success: true,
+        result: {
+          length_unit_code: opts["LengthUnit"],
+          length_unit_name: names[opts["LengthUnit"]] || "unknown",
+          inches_per_cm: 1.cm.to_f,
+          cm_per_inch: (1.0 / 1.cm.to_f),
+          model_title: model.title,
+          model_path: model.path
+        }
+      }
+    end
+
+    # transaction({ "action": "start"|"commit"|"abort", "name": "...", "disable_ui": true })
+    # Gives the client explicit control over undo boundaries when not using
+    # the auto-wrap in eval_ruby / batch.
+    def transaction(params)
+      params ||= {}
+      model = Sketchup.active_model
+      raise "No active model" unless model
+      action = (params["action"] || "start").downcase
+      case action
+      when "start", "begin"
+        model.start_operation(params["name"] || "MCP transaction", params["disable_ui"] != false)
+        { success: true, result: { action: "started" } }
+      when "commit", "end"
+        model.commit_operation
+        { success: true, result: { action: "committed" } }
+      when "abort", "rollback", "cancel"
+        model.abort_operation
+        { success: true, result: { action: "aborted" } }
+      else
+        raise "Unknown transaction action: #{action}"
+      end
+    end
+
+    # ──────────────────────────────────────────────────────────────────
+
+    def eval_ruby(params)
+      code = params["code"].to_s
+      timeout_s = (params["timeout"] || @eval_timeout).to_i
+      wrap_undo = params["wrap_undo"] != false  # default true
+      undo_name = params["undo_name"] || "MCP eval_ruby"
+
+      debug "Evaluating Ruby code (#{code.bytesize} bytes, timeout=#{timeout_s}s, wrap_undo=#{wrap_undo})"
+
+      begin
+        eval_binding = TOPLEVEL_BINDING.dup
+        raw_result = nil
+
+        runner = lambda do
+          raw_result = eval(code, eval_binding)
+        end
+
+        Timeout::timeout(timeout_s, Timeout::Error) do
+          if wrap_undo && Sketchup.active_model
+            Sketchup.active_model.start_operation(undo_name, true)
+            begin
+              runner.call
+              Sketchup.active_model.commit_operation
+            rescue StandardError
+              Sketchup.active_model.abort_operation rescue nil
+              raise
+            end
+          else
+            runner.call
+          end
+        end
+
+        debug "Code evaluation completed"
+
+        # A5: structured result — try to JSON-serialize; fall back to inspect.
+        value_json = begin
+          JSON.generate(raw_result)
+        rescue StandardError
+          nil
+        end
+
+        {
+          success: true,
+          result: {
+            value:   value_json,                    # nil if not JSON-serializable
+            inspect: (raw_result.inspect[0, 10_000] rescue raw_result.to_s[0, 10_000]),
+            class:   raw_result.class.name
+          }
+        }
+      rescue Timeout::Error
+        warn "eval_ruby timed out after #{timeout_s}s"
+        raise "Ruby evaluation timed out after #{timeout_s}s (hint: pass {\"timeout\": N} to increase)"
       rescue StandardError => e
-        log "Error in eval_ruby: #{e.message}"
-        log e.backtrace.join("\n")
+        error "eval_ruby error: #{e.message}"
+        debug e.backtrace.first(10).join("\n")
         raise "Ruby evaluation error: #{e.message}"
       end
     end
