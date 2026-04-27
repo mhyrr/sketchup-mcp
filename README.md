@@ -28,7 +28,7 @@ We're using uv so you'll need to ```brew install uv```
 
 ### Sketchup Extension
 
-1. Download or build the latest `.rbz` file
+1. Download or build the latest `.rbz` file (run `ruby ./su_mcp/package.rb`)
 2. In Sketchup, go to Window > Extension Manager
 3. Click "Install Extension" and select the downloaded `.rbz` file
 4. Restart Sketchup
