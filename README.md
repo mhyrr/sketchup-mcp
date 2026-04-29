@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/mhyrr-sketchup-mcp-badge.png)](https://mseep.ai/app/mhyrr-sketchup-mcp)
+
 # SketchupMCP - Sketchup Model Context Protocol Integration
 
 SketchupMCP connects Sketchup to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
