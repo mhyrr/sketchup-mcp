@@ -24,6 +24,13 @@ ENV/
 .ruby-gemset
 .rvmrc
 
+# Build artifacts
+rbz_stage/
+_rbz_stage/
+
+# Local Claude state (handoffs, project memory, hooks) — not for commit
+.claude/
+
 # Sketchup specific
 *.rbz
 

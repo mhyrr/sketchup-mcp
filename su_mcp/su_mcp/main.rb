@@ -55,8 +55,26 @@ module SU_MCP
                 log "Connection waiting..."
                 client = @server.accept_nonblock
                 log "Client accepted"
-                
-                data = client.gets
+
+                # Read with hard 0.5s budget — never freeze UI thread on idle clients.
+                # Loop to handle TCP fragmentation; 'gets' alone could still block on partial JSON.
+                data = nil
+                buffer = String.new
+                deadline = Time.now + 0.05
+                while !buffer.include?("\n")
+                  remaining = deadline - Time.now
+                  break if remaining <= 0
+                  ready, _, _ = IO.select([client], nil, nil, remaining)
+                  break unless ready
+                  begin
+                    chunk = client.recv_nonblock(65_536)
+                    break if chunk.empty?  # EOF before newline
+                    buffer << chunk
+                  rescue IO::WaitReadable
+                    # spurious wakeup — keep polling
+                  end
+                end
+                data = buffer.empty? ? nil : buffer
                 log "Raw data: #{data.inspect}"
                 
                 if data
