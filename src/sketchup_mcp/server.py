@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.17"
+__version__ = "0.1.20"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -196,36 +196,29 @@ class SketchupConnection:
 _sketchup_connection = None
 
 def get_sketchup_connection():
-    """Get or create a persistent Sketchup connection"""
+    """Get a fresh connection to Sketchup.
+
+    The Ruby-side server handles exactly one request per TCP connection and
+    then closes it, so a cached socket is always stale. The previous
+    send-a-ping-but-never-read-the-reply probe poisoned the socket with an
+    unread "Method not found" response that the next real command then
+    consumed, so always open a new connection per call instead.
+    """
     global _sketchup_connection
-    
+
     if _sketchup_connection is not None:
         try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
-    
-    if _sketchup_connection is None:
-        _sketchup_connection = SketchupConnection(host="localhost", port=9876)
-        if not _sketchup_connection.connect():
-            logger.error("Failed to connect to Sketchup")
-            _sketchup_connection = None
-            raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
-        logger.info("Created new persistent connection to Sketchup")
-    
+            _sketchup_connection.disconnect()
+        except Exception:
+            pass
+
+    _sketchup_connection = SketchupConnection(host="localhost", port=9876)
+    if not _sketchup_connection.connect():
+        logger.error("Failed to connect to Sketchup")
+        _sketchup_connection = None
+        raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
+    logger.info("Created new connection to Sketchup")
+
     return _sketchup_connection
 
 @asynccontextmanager
@@ -235,7 +228,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("SketchupMCP server starting up")
         try:
             sketchup = get_sketchup_connection()
-            logger.info("Successfully connected to Sketchup on startup")
+            # The Ruby-side server is one-request-per-connection; leaving this
+            # warm-up socket open makes its blocking accept loop freeze SketchUp.
+            sketchup.disconnect()
+            logger.info("Successfully connected to Sketchup on startup (socket released)")
         except Exception as e:
             logger.warning(f"Could not connect to Sketchup on startup: {str(e)}")
             logger.warning("Make sure the Sketchup extension is running")
@@ -261,20 +257,22 @@ def create_component(
     ctx: Context,
     type: str = "cube",
     position: List[float] = None,
-    dimensions: List[float] = None
+    dimensions: List[float] = None,
+    unit: str = "inch"
 ) -> str:
-    """Create a new component in Sketchup"""
+    """Create a new component in Sketchup. unit: inch (default), mm, cm or m"""
     try:
-        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, request_id={ctx.request_id}")
-        
+        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, unit={unit}, request_id={ctx.request_id}")
+
         sketchup = get_sketchup_connection()
-        
+
         params = {
             "name": "create_component",
             "arguments": {
                 "type": type,
                 "position": position or [0,0,0],
-                "dimensions": dimensions or [1,1,1]
+                "dimensions": dimensions or [1,1,1],
+                "unit": unit
             }
         }
         
@@ -361,6 +359,99 @@ def get_selection(ctx: Context) -> str:
         return f"Error getting selection: {str(e)}"
 
 @mcp.tool()
+def get_model_info(ctx: Context, id: str = None) -> str:
+    """Inspect the Sketchup model. Without id: global summary (entity counts by
+    type, model bounds, scenes, layers, materials, units, selection). With an
+    entity id: details for that entity (bounds, layer, definition, volume,
+    surface area, face/edge counts). Read-only."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {}
+        if id is not None:
+            arguments["id"] = id
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_model_info",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error getting model info: {str(e)}"
+
+@mcp.tool()
+def set_camera(
+    ctx: Context,
+    standard_view: str = None,
+    eye: List[float] = None,
+    target: List[float] = None,
+    up: List[float] = None,
+    fov: float = None,
+    perspective: bool = True,
+    zoom_extents: bool = False
+) -> str:
+    """Position the camera. standard_view: top/bottom/front/back/left/right/iso
+    (centered on the model). Or pass explicit eye/target (required together) and
+    optional up vector, in SketchUp inches. fov in degrees; perspective=False
+    gives an orthographic view; zoom_extents=True fits the model after moving.
+    Pair with export_scene(format='png') to capture from the new viewpoint."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {"perspective": perspective, "zoom_extents": zoom_extents}
+        if standard_view is not None:
+            arguments["standard_view"] = standard_view
+        if eye is not None and target is not None:
+            arguments["eye"] = eye
+            arguments["target"] = target
+            if up is not None:
+                arguments["up"] = up
+        if fov is not None:
+            arguments["fov"] = fov
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "set_camera",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error setting camera: {str(e)}"
+
+@mcp.tool()
+def boolean_operation(
+    ctx: Context,
+    operation: str,
+    target_id: str,
+    tool_id: str,
+    delete_originals: bool = False
+) -> str:
+    """Boolean operation between two groups/components: 'union', 'difference'
+    (target minus tool) or 'intersection'. Distances/sizes are in SketchUp
+    inches. Returns the result group's resourceId."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "boolean_operation",
+                "arguments": {
+                    "operation": operation,
+                    "target_id": target_id,
+                    "tool_id": tool_id,
+                    "delete_originals": delete_originals
+                }
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error in boolean operation: {str(e)}"
+
+@mcp.tool()
 def set_material(
     ctx: Context,
     id: str,
@@ -387,9 +478,13 @@ def set_material(
 @mcp.tool()
 def export_scene(
     ctx: Context,
-    format: str = "skp"
+    format: str = "skp",
+    width: int = 1920,
+    height: int = 1080
 ) -> str:
-    """Export the current scene"""
+    """Export the current scene (skp/obj/dae/stl/png/jpg). For image formats
+    width/height set the viewport export size; the returned path points at the
+    exported file in the system temp directory."""
     try:
         sketchup = get_sketchup_connection()
         result = sketchup.send_command(
@@ -397,12 +492,20 @@ def export_scene(
             params={
                 "name": "export",
                 "arguments": {
-                    "format": format
+                    "format": format,
+                    "width": width,
+                    "height": height
                 }
             },
             request_id=ctx.request_id
         )
-        return json.dumps(result)
+        # Surface the export path so callers can actually find the file.
+        response = {"success": True}
+        if isinstance(result, dict):
+            for key in ("path", "format"):
+                if result.get(key):
+                    response[key] = result[key]
+        return json.dumps(response)
     except Exception as e:
         return f"Error exporting scene: {str(e)}"
 
@@ -416,9 +519,13 @@ def create_mortise_tenon(
     depth: float = 1.0,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a mortise and tenon joint between two components"""
+    """Create a mortise and tenon joint between two boards. The mortise board
+    gets a rectangular hole, the tenon board a matching projection, on the
+    faces nearest each other. unit: inch (default), mm, cm, m. Boards must be
+    solids; each is replaced by the jointed result (new entity ids returned)."""
     try:
         logger.info(f"create_mortise_tenon called with mortise_id={mortise_id}, tenon_id={tenon_id}, width={width}, height={height}, depth={depth}, offsets=({offset_x}, {offset_y}, {offset_z})")
         
@@ -436,7 +543,8 @@ def create_mortise_tenon(
                     "depth": depth,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -460,9 +568,12 @@ def create_dovetail(
     num_tails: int = 3,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a dovetail joint between two components"""
+    """Create a dovetail joint between two boards: trapezoidal tails added to
+    the tail board, matching sockets cut from the pin board. angle in degrees.
+    unit: inch (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_dovetail called with tail_id={tail_id}, pin_id={pin_id}, width={width}, height={height}, depth={depth}, angle={angle}, num_tails={num_tails}")
         
@@ -482,7 +593,8 @@ def create_dovetail(
                     "num_tails": num_tails,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -505,9 +617,12 @@ def create_finger_joint(
     num_fingers: int = 5,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a finger joint (box joint) between two components"""
+    """Create a finger joint (box joint): fingers added across board1's near
+    face, matching slots cut into board2, so the boards interlock. unit: inch
+    (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_finger_joint called with board1_id={board1_id}, board2_id={board2_id}, width={width}, height={height}, depth={depth}, num_fingers={num_fingers}")
         
@@ -526,7 +641,8 @@ def create_finger_joint(
                     "num_fingers": num_fingers,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -543,7 +659,19 @@ def eval_ruby(
     ctx: Context,
     code: str
 ) -> str:
-    """Evaluate arbitrary Ruby code in Sketchup"""
+    """Evaluate arbitrary Ruby code in Sketchup — use this for anything without
+    a dedicated tool. Common recipes (m = Sketchup.active_model):
+    - save: m.save('/path/model.skp') | non-destructive copy: m.save_copy('/path/copy.skp')
+    - undo/redo: m.undo | m.redo
+    - tag/layer: l = m.layers.add('Walls'); m.active_layer = l; entity.layer = l
+    - scene/page: m.pages.add('Scene 1'); m.pages.selected_page = m.pages['Scene 1']
+    - import file: m.import('/path/file.dwg') (supports dwg/dxf/ifc/kmz/3ds/stl/images)
+    - follow-me (loft): face.followme(path_edges)
+    - offset face: face.offset(2.0) # inches
+    - shadows: s = m.shadow_info; s['ShadowDate']='2026/06/21'; s['ShadowTime']='14:00:00'
+    - display toggles: m.rendering_options['DisplayShadows'] = true
+    - arc/curve/ngon/text: entities.add_arc / add_curve / add_ngon / add_3d_text
+    Runs inside one undoable operation; if the code raises, changes roll back."""
     try:
         logger.info(f"eval_ruby called with code length: {len(code)}")
         
