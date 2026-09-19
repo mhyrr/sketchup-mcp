@@ -62,14 +62,14 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
-* `get_scene_info` - Gets information about the current Sketchup scene
-* `get_selected_components` - Gets information about currently selected components
-* `create_component` - Create a new component with specified parameters
-* `delete_component` - Remove a component from the scene
+* `create_component` - Create a new component (`cube`, `cylinder`, `sphere` or `cone`) at a position with given dimensions. Use `unit` (`inch` default, `mm`, `cm`, `m`) to control the unit of position/dimensions; the result is a real component instance, not loose geometry
+* `delete_component` - Remove a component from the scene by entity ID
 * `transform_component` - Move, rotate, or scale a component
-* `set_material` - Apply materials to components
-* `export_scene` - Export the current scene to various formats
-* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
+* `get_selection` - Get currently selected entities
+* `set_material` - Apply a material/color to a component (named colors or `#RRGGBB`)
+* `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. Image exports accept `width`/`height` and the response reports the `path` of the exported file (in the system temp directory), so it can be read directly by the client
+* `create_mortise_tenon` / `create_dovetail` / `create_finger_joint` - Woodworking joints between two boards
+* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations. Each evaluation runs inside an undoable operation; if the code raises, the changes are rolled back and the error (including its class) is returned to the client
 
 ### Example Commands
 

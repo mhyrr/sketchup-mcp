@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -196,36 +196,29 @@ class SketchupConnection:
 _sketchup_connection = None
 
 def get_sketchup_connection():
-    """Get or create a persistent Sketchup connection"""
+    """Get a fresh connection to Sketchup.
+
+    The Ruby-side server handles exactly one request per TCP connection and
+    then closes it, so a cached socket is always stale. The previous
+    send-a-ping-but-never-read-the-reply probe poisoned the socket with an
+    unread "Method not found" response that the next real command then
+    consumed, so always open a new connection per call instead.
+    """
     global _sketchup_connection
-    
+
     if _sketchup_connection is not None:
         try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
-    
-    if _sketchup_connection is None:
-        _sketchup_connection = SketchupConnection(host="localhost", port=9876)
-        if not _sketchup_connection.connect():
-            logger.error("Failed to connect to Sketchup")
-            _sketchup_connection = None
-            raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
-        logger.info("Created new persistent connection to Sketchup")
-    
+            _sketchup_connection.disconnect()
+        except Exception:
+            pass
+
+    _sketchup_connection = SketchupConnection(host="localhost", port=9876)
+    if not _sketchup_connection.connect():
+        logger.error("Failed to connect to Sketchup")
+        _sketchup_connection = None
+        raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
+    logger.info("Created new connection to Sketchup")
+
     return _sketchup_connection
 
 @asynccontextmanager
@@ -235,7 +228,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("SketchupMCP server starting up")
         try:
             sketchup = get_sketchup_connection()
-            logger.info("Successfully connected to Sketchup on startup")
+            # The Ruby-side server is one-request-per-connection; leaving this
+            # warm-up socket open makes its blocking accept loop freeze SketchUp.
+            sketchup.disconnect()
+            logger.info("Successfully connected to Sketchup on startup (socket released)")
         except Exception as e:
             logger.warning(f"Could not connect to Sketchup on startup: {str(e)}")
             logger.warning("Make sure the Sketchup extension is running")
@@ -261,20 +257,22 @@ def create_component(
     ctx: Context,
     type: str = "cube",
     position: List[float] = None,
-    dimensions: List[float] = None
+    dimensions: List[float] = None,
+    unit: str = "inch"
 ) -> str:
-    """Create a new component in Sketchup"""
+    """Create a new component in Sketchup. unit: inch (default), mm, cm or m"""
     try:
-        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, request_id={ctx.request_id}")
-        
+        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, unit={unit}, request_id={ctx.request_id}")
+
         sketchup = get_sketchup_connection()
-        
+
         params = {
             "name": "create_component",
             "arguments": {
                 "type": type,
                 "position": position or [0,0,0],
-                "dimensions": dimensions or [1,1,1]
+                "dimensions": dimensions or [1,1,1],
+                "unit": unit
             }
         }
         
@@ -387,9 +385,13 @@ def set_material(
 @mcp.tool()
 def export_scene(
     ctx: Context,
-    format: str = "skp"
+    format: str = "skp",
+    width: int = 1920,
+    height: int = 1080
 ) -> str:
-    """Export the current scene"""
+    """Export the current scene (skp/obj/dae/stl/png/jpg). For image formats
+    width/height set the viewport export size; the returned path points at the
+    exported file in the system temp directory."""
     try:
         sketchup = get_sketchup_connection()
         result = sketchup.send_command(
@@ -397,12 +399,20 @@ def export_scene(
             params={
                 "name": "export",
                 "arguments": {
-                    "format": format
+                    "format": format,
+                    "width": width,
+                    "height": height
                 }
             },
             request_id=ctx.request_id
         )
-        return json.dumps(result)
+        # Surface the export path so callers can actually find the file.
+        response = {"success": True}
+        if isinstance(result, dict):
+            for key in ("path", "format"):
+                if result.get(key):
+                    response[key] = result[key]
+        return json.dumps(response)
     except Exception as e:
         return f"Error exporting scene: {str(e)}"
 
