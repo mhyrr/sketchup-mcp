@@ -1,8 +1,14 @@
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
 import asyncio
 import logging
+import os
+import re
+import tempfile
+import urllib.request
+import urllib.parse
+import zipfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -13,7 +19,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("SketchupMCPServer")
 
 # Define version directly to avoid pkg_resources dependency
-__version__ = "0.1.17"
+__version__ = "0.2.1"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
 @dataclass
@@ -58,7 +64,7 @@ class SketchupConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        sock.settimeout(15.0)
+        sock.settimeout(120.0)
         
         try:
             while True:
@@ -149,7 +155,7 @@ class SketchupConnection:
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
                 
-                self.sock.settimeout(15.0)
+                self.sock.settimeout(120.0)
                 
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
@@ -196,36 +202,29 @@ class SketchupConnection:
 _sketchup_connection = None
 
 def get_sketchup_connection():
-    """Get or create a persistent Sketchup connection"""
+    """Get a fresh connection to Sketchup.
+
+    The Ruby-side server handles exactly one request per TCP connection and
+    then closes it, so a cached socket is always stale. The previous
+    send-a-ping-but-never-read-the-reply probe poisoned the socket with an
+    unread "Method not found" response that the next real command then
+    consumed, so always open a new connection per call instead.
+    """
     global _sketchup_connection
-    
+
     if _sketchup_connection is not None:
         try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
-    
-    if _sketchup_connection is None:
-        _sketchup_connection = SketchupConnection(host="localhost", port=9876)
-        if not _sketchup_connection.connect():
-            logger.error("Failed to connect to Sketchup")
-            _sketchup_connection = None
-            raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
-        logger.info("Created new persistent connection to Sketchup")
-    
+            _sketchup_connection.disconnect()
+        except Exception:
+            pass
+
+    _sketchup_connection = SketchupConnection(host="localhost", port=9876)
+    if not _sketchup_connection.connect():
+        logger.error("Failed to connect to Sketchup")
+        _sketchup_connection = None
+        raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
+    logger.info("Created new connection to Sketchup")
+
     return _sketchup_connection
 
 @asynccontextmanager
@@ -235,7 +234,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("SketchupMCP server starting up")
         try:
             sketchup = get_sketchup_connection()
-            logger.info("Successfully connected to Sketchup on startup")
+            # The Ruby-side server is one-request-per-connection; leaving this
+            # warm-up socket open makes its blocking accept loop freeze SketchUp.
+            sketchup.disconnect()
+            logger.info("Successfully connected to Sketchup on startup (socket released)")
         except Exception as e:
             logger.warning(f"Could not connect to Sketchup on startup: {str(e)}")
             logger.warning("Make sure the Sketchup extension is running")
@@ -261,20 +263,22 @@ def create_component(
     ctx: Context,
     type: str = "cube",
     position: List[float] = None,
-    dimensions: List[float] = None
+    dimensions: List[float] = None,
+    unit: str = "inch"
 ) -> str:
-    """Create a new component in Sketchup"""
+    """Create a new component in Sketchup. unit: inch (default), mm, cm or m"""
     try:
-        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, request_id={ctx.request_id}")
-        
+        logger.info(f"create_component called with type={type}, position={position}, dimensions={dimensions}, unit={unit}, request_id={ctx.request_id}")
+
         sketchup = get_sketchup_connection()
-        
+
         params = {
             "name": "create_component",
             "arguments": {
                 "type": type,
                 "position": position or [0,0,0],
-                "dimensions": dimensions or [1,1,1]
+                "dimensions": dimensions or [1,1,1],
+                "unit": unit
             }
         }
         
@@ -361,6 +365,99 @@ def get_selection(ctx: Context) -> str:
         return f"Error getting selection: {str(e)}"
 
 @mcp.tool()
+def get_model_info(ctx: Context, id: str = None) -> str:
+    """Inspect the Sketchup model. Without id: global summary (entity counts by
+    type, model bounds, scenes, layers, materials, units, selection). With an
+    entity id: details for that entity (bounds, layer, definition, volume,
+    surface area, face/edge counts). Read-only."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {}
+        if id is not None:
+            arguments["id"] = id
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_model_info",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error getting model info: {str(e)}"
+
+@mcp.tool()
+def set_camera(
+    ctx: Context,
+    standard_view: str = None,
+    eye: List[float] = None,
+    target: List[float] = None,
+    up: List[float] = None,
+    fov: float = None,
+    perspective: bool = True,
+    zoom_extents: bool = False
+) -> str:
+    """Position the camera. standard_view: top/bottom/front/back/left/right/iso
+    (centered on the model). Or pass explicit eye/target (required together) and
+    optional up vector, in SketchUp inches. fov in degrees; perspective=False
+    gives an orthographic view; zoom_extents=True fits the model after moving.
+    Pair with export_scene(format='png') to capture from the new viewpoint."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {"perspective": perspective, "zoom_extents": zoom_extents}
+        if standard_view is not None:
+            arguments["standard_view"] = standard_view
+        if eye is not None and target is not None:
+            arguments["eye"] = eye
+            arguments["target"] = target
+            if up is not None:
+                arguments["up"] = up
+        if fov is not None:
+            arguments["fov"] = fov
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "set_camera",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error setting camera: {str(e)}"
+
+@mcp.tool()
+def boolean_operation(
+    ctx: Context,
+    operation: str,
+    target_id: str,
+    tool_id: str,
+    delete_originals: bool = False
+) -> str:
+    """Boolean operation between two groups/components: 'union', 'difference'
+    (target minus tool) or 'intersection'. Distances/sizes are in SketchUp
+    inches. Returns the result group's resourceId."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "boolean_operation",
+                "arguments": {
+                    "operation": operation,
+                    "target_id": target_id,
+                    "tool_id": tool_id,
+                    "delete_originals": delete_originals
+                }
+            },
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error in boolean operation: {str(e)}"
+
+@mcp.tool()
 def set_material(
     ctx: Context,
     id: str,
@@ -387,24 +484,100 @@ def set_material(
 @mcp.tool()
 def export_scene(
     ctx: Context,
-    format: str = "skp"
+    format: str = "skp",
+    filepath: str = None,
+    width: int = 1920,
+    height: int = 1080
 ) -> str:
-    """Export the current scene"""
+    """Export the current scene (skp/obj/dae/stl/png/jpg). filepath: absolute
+    destination path (parent folders are created); omit for a timestamped
+    file in the system temp directory. For image formats width/height set the
+    viewport export size. skp exports use save_copy, so the working model's
+    own path is never rebound."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {
+            "format": format,
+            "width": width,
+            "height": height
+        }
+        if filepath:
+            arguments["filepath"] = filepath
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "export",
+                "arguments": arguments
+            },
+            request_id=ctx.request_id
+        )
+        # Surface the export path so callers can actually find the file.
+        response = {"success": True}
+        if isinstance(result, dict):
+            for key in ("path", "format"):
+                if result.get(key):
+                    response[key] = result[key]
+        return json.dumps(response)
+    except Exception as e:
+        return f"Error exporting scene: {str(e)}"
+
+@mcp.tool()
+def get_viewport_screenshot(
+    ctx: Context,
+    width: int = 1600,
+    height: int = 900
+) -> Image:
+    """Capture the current SketchUp 3D viewport and return it as an image,
+    so you can see the model directly without reading files. Pair with
+    set_camera to inspect from specific viewpoints."""
+    temp_path = os.path.join(tempfile.gettempdir(), f"sketchup_screenshot_{os.getpid()}.png")
+    try:
+        sketchup = get_sketchup_connection()
+        sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "get_viewport_screenshot",
+                "arguments": {
+                    "filepath": temp_path,
+                    "width": width,
+                    "height": height
+                }
+            },
+            request_id=ctx.request_id
+        )
+        if not os.path.exists(temp_path):
+            raise Exception("Screenshot file was not created")
+        with open(temp_path, "rb") as f:
+            image_bytes = f.read()
+        return Image(data=image_bytes, format="png")
+    except Exception as e:
+        logger.error(f"Error capturing screenshot: {str(e)}")
+        raise Exception(f"Screenshot failed: {str(e)}")
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+@mcp.tool()
+def get_addon_status(ctx: Context) -> str:
+    """Lightweight health check: SketchUp version, platform, Pro status,
+    current model title/path and entity count, bridge port and uptime.
+    Use this to verify the SketchUp extension is reachable before doing
+    anything else."""
     try:
         sketchup = get_sketchup_connection()
         result = sketchup.send_command(
             method="tools/call",
             params={
-                "name": "export",
-                "arguments": {
-                    "format": format
-                }
+                "name": "get_addon_status",
+                "arguments": {}
             },
             request_id=ctx.request_id
         )
         return json.dumps(result)
     except Exception as e:
-        return f"Error exporting scene: {str(e)}"
+        return f"Error getting addon status: {str(e)}"
 
 @mcp.tool()
 def create_mortise_tenon(
@@ -416,9 +589,13 @@ def create_mortise_tenon(
     depth: float = 1.0,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a mortise and tenon joint between two components"""
+    """Create a mortise and tenon joint between two boards. The mortise board
+    gets a rectangular hole, the tenon board a matching projection, on the
+    faces nearest each other. unit: inch (default), mm, cm, m. Boards must be
+    solids; each is replaced by the jointed result (new entity ids returned)."""
     try:
         logger.info(f"create_mortise_tenon called with mortise_id={mortise_id}, tenon_id={tenon_id}, width={width}, height={height}, depth={depth}, offsets=({offset_x}, {offset_y}, {offset_z})")
         
@@ -436,7 +613,8 @@ def create_mortise_tenon(
                     "depth": depth,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -460,9 +638,12 @@ def create_dovetail(
     num_tails: int = 3,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a dovetail joint between two components"""
+    """Create a dovetail joint between two boards: trapezoidal tails added to
+    the tail board, matching sockets cut from the pin board. angle in degrees.
+    unit: inch (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_dovetail called with tail_id={tail_id}, pin_id={pin_id}, width={width}, height={height}, depth={depth}, angle={angle}, num_tails={num_tails}")
         
@@ -482,7 +663,8 @@ def create_dovetail(
                     "num_tails": num_tails,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -505,9 +687,12 @@ def create_finger_joint(
     num_fingers: int = 5,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
-    offset_z: float = 0.0
+    offset_z: float = 0.0,
+    unit: str = "inch"
 ) -> str:
-    """Create a finger joint (box joint) between two components"""
+    """Create a finger joint (box joint): fingers added across board1's near
+    face, matching slots cut into board2, so the boards interlock. unit: inch
+    (default), mm, cm, m. Boards are replaced by jointed results."""
     try:
         logger.info(f"create_finger_joint called with board1_id={board1_id}, board2_id={board2_id}, width={width}, height={height}, depth={depth}, num_fingers={num_fingers}")
         
@@ -526,7 +711,8 @@ def create_finger_joint(
                     "num_fingers": num_fingers,
                     "offset_x": offset_x,
                     "offset_y": offset_y,
-                    "offset_z": offset_z
+                    "offset_z": offset_z,
+                    "unit": unit
                 }
             },
             request_id=ctx.request_id
@@ -543,7 +729,19 @@ def eval_ruby(
     ctx: Context,
     code: str
 ) -> str:
-    """Evaluate arbitrary Ruby code in Sketchup"""
+    """Evaluate arbitrary Ruby code in Sketchup — use this for anything without
+    a dedicated tool. Common recipes (m = Sketchup.active_model):
+    - save: m.save('/path/model.skp') | non-destructive copy: m.save_copy('/path/copy.skp')
+    - undo/redo: m.undo | m.redo
+    - tag/layer: l = m.layers.add('Walls'); m.active_layer = l; entity.layer = l
+    - scene/page: m.pages.add('Scene 1'); m.pages.selected_page = m.pages['Scene 1']
+    - import file: m.import('/path/file.dwg') (supports dwg/dxf/ifc/kmz/3ds/stl/images)
+    - follow-me (loft): face.followme(path_edges)
+    - offset face: face.offset(2.0) # inches
+    - shadows: s = m.shadow_info; s['ShadowDate']='2026/06/21'; s['ShadowTime']='14:00:00'
+    - display toggles: m.rendering_options['DisplayShadows'] = true
+    - arc/curve/ngon/text: entities.add_arc / add_curve / add_ngon / add_3d_text
+    Runs inside one undoable operation; if the code raises, changes roll back."""
     try:
         logger.info(f"eval_ruby called with code length: {len(code)}")
         
@@ -575,6 +773,392 @@ def eval_ruby(
             "success": False,
             "error": str(e)
         })
+
+
+# ---------------------------------------------------------------------------
+# Asset layer: free CC0 texture/model sources with public APIs, plus generic
+# file import. SketchUp 2025+ imports GLB natively (geometry, materials and
+# embedded textures), so no converter is needed.
+# ---------------------------------------------------------------------------
+
+ASSET_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".sketchup_mcp_assets")
+
+def _http_get_bytes(url: str, headers: dict = None, timeout: float = 60.0) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "sketchup-mcp/asset-layer", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+def _http_get_json(url: str, headers: dict = None):
+    return json.loads(_http_get_bytes(url, headers).decode("utf-8"))
+
+def _cache_path(*parts) -> str:
+    path = os.path.join(ASSET_CACHE_DIR, *parts)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+def _ambientcg_search(query: str, limit: int = 10):
+    url = "https://ambientcg.com/api/v2/full_json?" + urllib.parse.urlencode(
+        {"q": query, "type": "Material", "limit": limit})
+    data = _http_get_json(url)
+    return [
+        {"id": a["assetId"], "name": a.get("displayName") or a["assetId"],
+         "preview": (a.get("previewImage") or {}).get("256-PNG"), "source": "ambientcg"}
+        for a in data.get("foundAssets", [])
+    ]
+
+def _polyhaven_search(query: str, limit: int = 10):
+    url = f"https://api.polyhaven.com/assets?t=textures&q={urllib.parse.quote(query)}"
+    data = _http_get_json(url, headers={"Referer": "sketchup-mcp"})
+    # The API's q parameter only matches some fields; refine client-side by
+    # name/category/tag substring so results are actually relevant.
+    q = query.lower()
+    def _words(value):
+        if isinstance(value, dict):
+            return " ".join(value.keys())
+        if isinstance(value, list):
+            return " ".join(str(v) for v in value)
+        return str(value or "")
+    def matches(asset_id, a):
+        haystack = " ".join([asset_id, a.get("name") or "",
+                             _words(a.get("categories")),
+                             _words(a.get("tags"))]).lower()
+        return all(word in haystack for word in q.split())
+    filtered = {k: v for k, v in data.items() if matches(k, v)} or data
+    results = []
+    for asset_id, a in list(filtered.items())[:limit]:
+        results.append({
+            "id": asset_id, "name": a.get("name") or asset_id,
+            "preview": f"https://cdn.polyhaven.com/asset_img/thumbs/{asset_id}.png?width=256",
+            "source": "polyhaven"})
+    return results
+
+def _ambientcg_texture_file(asset_id: str) -> str:
+    """Download the ambientCG zip for the asset and return the diffuse JPG path."""
+    cached = None
+    for res in ("2K-JPG", "1K-JPG"):
+        zip_path = _cache_path(f"{asset_id}_{res}.zip")
+        if not os.path.exists(zip_path):
+            try:
+                data = _http_get_bytes(f"https://ambientcg.com/get?file={asset_id}_{res}.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(data)
+            except Exception:
+                continue
+        out_dir = _cache_path(asset_id)
+        os.makedirs(out_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(out_dir)
+        for name in sorted(os.listdir(out_dir)):
+            if re.search(r"_(Color|Diffuse|Col)\.jpg$", name, re.IGNORECASE):
+                cached = os.path.join(out_dir, name)
+                break
+        if cached:
+            return cached
+    raise Exception(f"Could not fetch a diffuse texture for {asset_id}")
+
+def _polyhaven_texture_file(asset_id: str) -> str:
+    """Resolve the diffuse JPG from Poly Haven (smallest size >= 1k)."""
+    files = _http_get_json(f"https://api.polyhaven.com/files/{asset_id}",
+                           headers={"Referer": "sketchup-mcp"})
+    diffuse = files.get("Diffuse") or {}
+    for size in ("1k", "2k", "4k"):
+        entry = diffuse.get(size, {}).get("jpg")
+        if entry:
+            dest = _cache_path(f"{asset_id}_diffuse_{size}.jpg")
+            if not os.path.exists(dest):
+                data = _http_get_bytes(entry["url"], headers={"Referer": "sketchup-mcp"})
+                with open(dest, "wb") as f:
+                    f.write(data)
+            return dest
+    raise Exception(f"No diffuse JPG found for Poly Haven asset {asset_id}")
+
+def _download_to_cache(url: str, filename: str) -> str:
+    dest = _cache_path(filename)
+    if not os.path.exists(dest):
+        data = _http_get_bytes(url)
+        with open(dest, "wb") as f:
+            f.write(data)
+    return dest
+
+@mcp.tool()
+def search_textures(ctx: Context, query: str, source: str = "ambientcg") -> str:
+    """Search free CC0 texture libraries: 'ambientcg' (default) or 'polyhaven'.
+    Returns asset ids/names; preview thumbnails via get_asset_preview."""
+    try:
+        if source == "ambientcg":
+            results = _ambientcg_search(query)
+        elif source == "polyhaven":
+            results = _polyhaven_search(query)
+        else:
+            return f"Unknown source '{source}' (use ambientcg or polyhaven)"
+        return json.dumps({"success": True, "source": source, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching textures: {str(e)}"
+
+@mcp.tool()
+def get_asset_preview(ctx: Context, asset_id: str, source: str = "ambientcg") -> Image:
+    """Fetch the preview thumbnail of a texture asset as an image."""
+    if source == "ambientcg":
+        results = _ambientcg_search(asset_id, limit=1)
+        url = results[0]["preview"] if results else None
+    else:
+        url = f"https://cdn.polyhaven.com/asset_img/thumbs/{asset_id}.png?width=256"
+    if not url:
+        raise Exception(f"No preview found for {asset_id}")
+    return Image(data=_http_get_bytes(url), format="png")
+
+@mcp.tool()
+def apply_texture(
+    ctx: Context,
+    id: str,
+    asset_id: str,
+    source: str = "ambientcg",
+    repeat: float = None
+) -> str:
+    """Download a CC0 texture (ambientcg/polyhaven) and apply it to an
+    entity's faces as a textured material. repeat: texture tile size in
+    SketchUp inches."""
+    try:
+        if source == "ambientcg":
+            texture_path = _ambientcg_texture_file(asset_id)
+        elif source == "polyhaven":
+            texture_path = _polyhaven_texture_file(asset_id)
+        else:
+            return f"Unknown source '{source}' (use ambientcg or polyhaven)"
+
+        sketchup = get_sketchup_connection()
+        arguments = {"id": id, "texture_path": texture_path, "material_name": asset_id}
+        if repeat:
+            arguments["size"] = repeat
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "set_texture", "arguments": arguments},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error applying texture: {str(e)}"
+
+@mcp.tool()
+def search_sketchfab(ctx: Context, query: str, count: int = 8) -> str:
+    """Search Sketchfab models (public search, no account needed). Returns
+    names and uids with a downloadability hint; downloading requires a
+    Sketchfab account/token - use import_glb with any glb URL you obtain."""
+    try:
+        url = f"https://api.sketchfab.com/v3/search?type=models&q={urllib.parse.quote(query)}&count={count}"
+        data = _http_get_json(url)
+        results = [
+            {"uid": r.get("uid"), "name": r.get("name"),
+             "downloadable": r.get("isDownloadable"),
+             "url": f"https://sketchfab.com/3d-models/{r.get('uid')}"}
+            for r in data.get("results", [])
+        ]
+        return json.dumps({"success": True, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching Sketchfab: {str(e)}"
+
+@mcp.tool()
+def search_polypizza(ctx: Context, query: str) -> str:
+    """Search Poly Pizza's free low-poly model library. Requires the
+    POLYPIZZA_API_KEY environment variable (free key from poly.pizza);
+    download the returned glb URLs with import_glb."""
+    api_key = os.environ.get("POLYPIZZA_API_KEY")
+    if not api_key:
+        return ("POLYPIZZA_API_KEY is not set. Get a free key at https://poly.pizza/"
+                "api/ and pass it via the MCP server environment.")
+    try:
+        url = f"https://api.poly.pizza/v1/search?q={urllib.parse.quote(query)}"
+        data = _http_get_json(url, headers={"X-API-Key": api_key})
+        results = [
+            {"name": r.get("name"), "glb": (r.get("download") or {}).get("glb"),
+             "license": r.get("license")}
+            for r in data.get("models", [])
+        ]
+        return json.dumps({"success": True, "count": len(results), "results": results})
+    except Exception as e:
+        return f"Error searching Poly Pizza: {str(e)}"
+
+@mcp.tool()
+def import_glb(ctx: Context, url: str) -> str:
+    """Download a glb/gltf/obj/dae/stl file from a URL and import it into
+    SketchUp. SketchUp 2025+ imports GLB natively with embedded textures."""
+    try:
+        filename = os.path.basename(urllib.parse.urlparse(url).path) or "asset.glb"
+        filepath = _download_to_cache(url, filename)
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "import_file", "arguments": {"filepath": filepath}},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error importing model: {str(e)}"
+
+@mcp.tool()
+def import_file(ctx: Context, filepath: str) -> str:
+    """Import a local file into SketchUp (skp component, glb/gltf, obj, dae,
+    stl, 3ds, dwg/dxf Pro, ifc, kmz, images). Use for 3D Warehouse .skp
+    downloads and local component libraries."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "import_file", "arguments": {"filepath": filepath}},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error importing file: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Docs lookup, selection control, undo/redo, and optional safe mode
+# ---------------------------------------------------------------------------
+
+DOC_BASE = "https://ruby.sketchup.com/"
+
+def _lookup_ruby_api(class_name: str, method: str = None) -> str:
+    """Fetch the official YARD docs page for a class and extract either the
+    method list or one method's signature and description."""
+    import html as html_module
+    name = class_name.strip().replace(".", "::")
+    parts = name.split("::") if "::" in name else [name]
+    if len(parts) == 1 and parts[0] not in ("Sketchup", "Geom", "UI", "Layout"):
+        parts = ["Sketchup", parts[0]]
+    candidates = ["/".join(parts)]
+    if parts[0] != "Sketchup" and len(parts) == 2:
+        candidates.append(parts[-1])
+
+    page = None
+    for c in candidates:
+        try:
+            page = _http_get_bytes(DOC_BASE + c + ".html").decode("utf-8", "replace")
+            break
+        except Exception:
+            continue
+    if page is None:
+        return (f"Class page not found for '{class_name}'. Browse "
+                f"https://ruby.sketchup.com/_index.html for the full list.")
+
+    def strip_tags(fragment: str) -> str:
+        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", fragment, flags=re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", html_module.unescape(text)).strip()
+
+    if method:
+        for suffix in ("instance_method", "class_method"):
+            marker = f'id="{method}-{suffix}"'
+            i = page.find(marker)
+            if i == -1:
+                continue
+            # The detail block runs until the next method anchor or the footer.
+            rest = page[i:]
+            rest = rest[rest.find(">") + 1:]
+            nxt = len(rest)
+            for end_marker in ('id="footer"',):
+                j = rest.find(end_marker, 200)
+                if j != -1:
+                    nxt = min(nxt, j)
+            m = re.search(r'id="[\w?!=<>+-]+-(?:instance|class)_method"', rest[200:])
+            if m:
+                nxt = min(nxt, 200 + m.start())
+            return f"{name}#{method}:\n" + strip_tags(rest[:nxt])[:2000]
+        return (f"Method '{method}' not found on {name}. Available methods are "
+                f"listed below.\n" + _lookup_ruby_api(class_name))
+
+    methods = re.findall(r'id="([\w?!=<>+-]+)-(?:instance|class)_method"', page)
+    unique = sorted(set(methods), key=lambda s: s.lower())
+    # Class docstring from the description block, if present.
+    desc = ""
+    m = re.search(r'<div id="description">(.*?)</div>\s*</div>', page, re.S)
+    if m:
+        desc = strip_tags(m.group(1))[:300]
+    listing = ", ".join(unique[:120])
+    out = f"{name} ({len(unique)} methods)"
+    if desc:
+        out += f"\n{desc}"
+    out += f"\nMethods: {listing}"
+    return out[:4000]
+
+# Safe mode: when SKETCHUP_MCP_SAFE_MODE=1, eval_ruby scripts are screened
+# against a blocklist before execution so an agent cannot touch the file
+# system, spawn processes, open sockets or quit SketchUp. Guardrail, not a
+# sandbox - a determined script could still evade string matching.
+_RUBY_BLOCKLIST = [
+    (re.compile(r"\bsystem\s*\(|\bexec\s*\(|\bspawn\s*\("), "OS command execution"),
+    (re.compile(r"%x[\[{(]|`[^`]*`"), "shell execution (%x/backticks)"),
+    (re.compile(r"\bIO\.popen|\bpopen\s*\("), "process spawn"),
+    (re.compile(r"\beval\s*\(|instance_eval|class_eval|module_eval"), "dynamic evaluation"),
+    (re.compile(r"\bFile\s*\.|\bFileUtils\b|\bTempfile\b|\bPathname\b"), "file I/O"),
+    (re.compile(r"\bDir\s*\.|\bDir\s*\["), "filesystem access"),
+    (re.compile(r"(?<![\w.])load\s+(?=['\"])|(?<![\w.])require\s+(?=['\"])"), "loading ruby files"),
+    (re.compile(r"\bNet::|\bTCPSocket\b|\bTCPServer\b|\bUDPSocket\b|open-uri|URI\.open"), "network access"),
+    (re.compile(r"Sketchup\.(open_file|quit|send_action|install_from_archive|load)\b"), "SketchUp system actions"),
+]
+
+def _safe_mode_check(code: str):
+    if os.environ.get("SKETCHUP_MCP_SAFE_MODE") != "1":
+        return None
+    for pattern, reason in _RUBY_BLOCKLIST:
+        m = pattern.search(code)
+        if m:
+            return (f"Safe mode (SKETCHUP_MCP_SAFE_MODE=1) blocked this script: {reason} "
+                    f"(matched {m.group(0)!r}). Rewrite the code without it.")
+    return None
+
+@mcp.tool()
+def lookup_ruby_api(ctx: Context, class_name: str, method: str = None) -> str:
+    """Look up the official SketchUp Ruby API documentation (ruby.sketchup.com).
+    class_name like 'Face', 'Entities', 'Model', 'Geom::Point3d', 'UI'. Without
+    method: lists the class's methods. With method (e.g. 'pushpull'): returns
+    its signature and description."""
+    try:
+        return _lookup_ruby_api(class_name, method)
+    except Exception as e:
+        return f"Error looking up API docs: {str(e)}"
+
+@mcp.tool()
+def set_selection(ctx: Context, ids: List[str] = None, mode: str = "replace") -> str:
+    """Control the selection. mode: 'replace' (default) selects exactly the
+    given entity ids, 'add' extends, 'remove' deselects them, 'clear' empties
+    the selection (ids not needed)."""
+    try:
+        sketchup = get_sketchup_connection()
+        arguments = {"mode": mode}
+        if ids:
+            arguments["ids"] = ids
+        result = sketchup.send_command(
+            method="tools/call",
+            params={"name": "set_selection", "arguments": arguments},
+            request_id=ctx.request_id
+        )
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error setting selection: {str(e)}"
+
+@mcp.tool()
+def undo(ctx: Context) -> str:
+    """Undo the last operation in SketchUp."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call", params={"name": "undo", "arguments": {}},
+            request_id=ctx.request_id)
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error undoing: {str(e)}"
+
+@mcp.tool()
+def redo(ctx: Context) -> str:
+    """Redo the last undone operation in SketchUp."""
+    try:
+        sketchup = get_sketchup_connection()
+        result = sketchup.send_command(
+            method="tools/call", params={"name": "redo", "arguments": {}},
+            request_id=ctx.request_id)
+        return json.dumps(result)
+    except Exception as e:
+        return f"Error redoing: {str(e)}"
 
 def main():
     mcp.run()
