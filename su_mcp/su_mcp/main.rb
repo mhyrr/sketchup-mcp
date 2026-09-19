@@ -2,6 +2,7 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'tmpdir'
 
 puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
@@ -47,6 +48,7 @@ module SU_MCP
         @running = true
         
         @timer_id = UI.start_timer(0.1, true) {
+          client = nil
           begin
             if @running
               # Check for connection
@@ -55,69 +57,40 @@ module SU_MCP
                 log "Connection waiting..."
                 client = @server.accept_nonblock
                 log "Client accepted"
-                
-                data = client.gets
+
+                # Never block the main thread waiting for input: a client that
+                # connects and stays idle (e.g. a warm-up/health-check socket)
+                # is dropped after a short deadline instead of freezing SketchUp.
+                data = read_request(client)
                 log "Raw data: #{data.inspect}"
-                
+
                 if data
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  end
+                  respond_to_request(client, data)
                 end
-                
-                client.close
+
                 log "Client closed"
               end
             end
           rescue IO::WaitReadable
             # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
+          rescue Exception => e
+            # Rescue Exception, not just StandardError: bridge requests may
+            # raise SyntaxError/SystemStackError/etc., and letting those escape
+            # used to leave the client without any response until it timed out.
+            log "Timer error: #{e.class}: #{e.message}"
+            log e.backtrace.join("\n") if e.backtrace
+            begin
+              client.write({
+                jsonrpc: "2.0",
+                error: { code: -32603, message: "#{e.class}: #{e.message}" },
+                id: nil
+              }.to_json + "\n")
+              client.flush
+            rescue Exception
+              # Client is gone; nothing else we can do.
+            end
+          ensure
+            client.close if client && !client.closed?
           end
         }
         
@@ -145,6 +118,62 @@ module SU_MCP
     end
 
     private
+
+    # Read one newline-terminated request without ever blocking indefinitely.
+    # Returns nil when the client sends nothing before the deadline.
+    def read_request(client, deadline_seconds = 2)
+      buffer = "".dup
+      deadline = Time.now + deadline_seconds
+      while (remaining = deadline - Time.now) > 0
+        ready = IO.select([client], nil, nil, remaining)
+        break unless ready
+        begin
+          chunk = client.read_nonblock(65_536)
+          buffer << chunk
+          break if buffer.include?("\n")
+        rescue IO::WaitReadable
+          retry
+        rescue EOFError, Errno::ECONNRESET
+          break
+        end
+      end
+      buffer.include?("\n") ? buffer : nil
+    end
+
+    # Parse the request and always write exactly one response, even when
+    # handling raises an unexpected exception class.
+    def respond_to_request(client, data)
+      original_id = nil
+      if data =~ /"id":\s*(\d+)/
+        original_id = $1.to_i
+        log "Found original request ID: #{original_id}"
+      end
+
+      begin
+        request = JSON.parse(data)
+        request["id"] = original_id if !request["id"] && original_id
+        response = handle_jsonrpc_request(request)
+      rescue JSON::ParserError => e
+        log "JSON parse error: #{e.message}"
+        response = {
+          jsonrpc: "2.0",
+          error: { code: -32700, message: "Parse error: #{e.message}" },
+          id: original_id
+        }
+      rescue Exception => e
+        log "Request error: #{e.class}: #{e.message}"
+        response = {
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "#{e.class}: #{e.message}" },
+          id: original_id
+        }
+      end
+
+      response_json = response.to_json + "\n"
+      client.write(response_json)
+      client.flush
+      log "Response sent"
+    end
 
     def handle_jsonrpc_request(request)
       log "Handling JSONRPC request: #{request.inspect}"
@@ -226,6 +255,10 @@ module SU_MCP
           transform_component(args)
         when "get_selection"
           get_selection
+        when "get_model_info"
+          get_model_info(args)
+        when "set_camera"
+          set_camera(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
@@ -250,14 +283,21 @@ module SU_MCP
 
         log "Tool call result: #{result.inspect}"
         if result[:success]
+          # Surface tool-specific fields (export path/format, joint ids,
+          # selection entities, ...) instead of dropping them.
+          extras = result.reject { |k, _| [:success, :result, :id].include?(k) }
+          text = result[:result]
+          if text.nil?
+            text = extras.empty? ? "Success" : extras.map { |k, v| "#{k}: #{v}" }.join("; ")
+          end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: {
-              content: [{ type: "text", text: result[:result] || "Success" }],
+              content: [{ type: "text", text: text }],
               isError: false,
               success: true,
               resourceId: result[:id]
-            },
+            }.merge(extras),
             id: request["id"]
           }
           log "Sending success response: #{response.inspect}"
@@ -291,202 +331,122 @@ module SU_MCP
       end
     end
 
+    # SketchUp's internal length unit is the inch; convert user-supplied
+    # values so tools can work in mm/cm/m without mental math.
+    UNIT_TO_INCH = {
+      "inch" => 1.0,
+      "in"   => 1.0,
+      "mm"   => 1.0 / 25.4,
+      "cm"   => 1.0 / 2.54,
+      "m"    => 100.0 / 2.54
+    }.freeze
+
     def create_component(params)
       log "Creating component with params: #{params.inspect}"
       model = Sketchup.active_model
-      log "Got active model: #{model.inspect}"
       entities = model.active_entities
-      log "Got active entities: #{entities.inspect}"
-      
+
       pos = params["position"] || [0,0,0]
       dims = params["dimensions"] || [1,1,1]
-      
+      unit = (params["unit"] || "inch").to_s.downcase
+      factor = UNIT_TO_INCH[unit]
+      raise "Unknown unit: #{unit.inspect} (supported: inch, mm, cm, m)" unless factor
+      pos = pos.map { |v| v.to_f * factor }
+      dims = dims.map { |v| v.to_f * factor }
+
+      # Build the geometry at the origin of a component definition, then place
+      # one instance at the requested position, so callers get a real reusable
+      # component instead of loose grouped geometry.
+      base_name = "MCP #{params["type"].to_s.capitalize}"
+      definition_name = base_name
+      n = 2
+      while model.definitions[definition_name]
+        definition_name = "#{base_name} #{n}"
+        n += 1
+      end
+      definition = model.definitions.add(definition_name)
+
       case params["type"]
       when "cube"
-        log "Creating cube at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          group = entities.add_group
-          log "Created group: #{group.inspect}"
-          
-          face = group.entities.add_face(
-            [pos[0], pos[1], pos[2]],
-            [pos[0] + dims[0], pos[1], pos[2]],
-            [pos[0] + dims[0], pos[1] + dims[1], pos[2]],
-            [pos[0], pos[1] + dims[1], pos[2]]
-          )
-          log "Created face: #{face.inspect}"
-          
-          face.pushpull(dims[2])
-          log "Pushed/pulled face by #{dims[2]}"
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error in create_component: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
-        end
+        face = definition.entities.add_face(
+          [0, 0, 0],
+          [dims[0], 0, 0],
+          [dims[0], dims[1], 0],
+          [0, dims[1], 0]
+        )
+        face.reverse! if face.normal.z < 0
+        face.pushpull(dims[2])
       when "cylinder"
-        log "Creating cylinder at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the cylinder
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          height = dims[2]
-          
-          # Create a circle at the base
-          center = [pos[0] + radius, pos[1] + radius, pos[2]]
-          
-          # Create points for a circle
-          num_segments = 24  # Number of segments for the circle
-          circle_points = []
-          
-          num_segments.times do |i|
-            angle = Math::PI * 2 * i / num_segments
-            x = center[0] + radius * Math.cos(angle)
-            y = center[1] + radius * Math.sin(angle)
-            z = center[2]
-            circle_points << [x, y, z]
-          end
-          
-          # Create the circular face
-          face = group.entities.add_face(circle_points)
-          
-          # Extrude the face to create the cylinder
-          face.pushpull(height)
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Created cylinder, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating cylinder: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        radius = dims[0] / 2.0
+        height = dims[2]
+        num_segments = 24
+        circle_points = (0...num_segments).map do |i|
+          angle = Math::PI * 2 * i / num_segments
+          [radius + radius * Math.cos(angle), radius + radius * Math.sin(angle), 0]
         end
+        face = definition.entities.add_face(circle_points)
+        face.reverse! if face.normal.z < 0
+        face.pushpull(height)
       when "sphere"
-        log "Creating sphere at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the sphere
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          center = [pos[0] + radius, pos[1] + radius, pos[2] + radius]
-          
-          # Use SketchUp's built-in sphere method if available
-          if Sketchup::Tools.respond_to?(:create_sphere)
-            Sketchup::Tools.create_sphere(center, radius, 24, group.entities)
-          else
-            # Fallback implementation using polygons
-            # Create a UV sphere with latitude and longitude segments
-            segments = 16
-            
-            # Create points for the sphere
-            points = []
-            for lat_i in 0..segments
-              lat = Math::PI * lat_i / segments
-              for lon_i in 0..segments
-                lon = 2 * Math::PI * lon_i / segments
-                x = center[0] + radius * Math.sin(lat) * Math.cos(lon)
-                y = center[1] + radius * Math.sin(lat) * Math.sin(lon)
-                z = center[2] + radius * Math.cos(lat)
-                points << [x, y, z]
-              end
-            end
-            
-            # Create faces for the sphere (simplified approach)
-            for lat_i in 0...segments
-              for lon_i in 0...segments
-                i1 = lat_i * (segments + 1) + lon_i
-                i2 = i1 + 1
-                i3 = i1 + segments + 1
-                i4 = i3 + 1
-                
-                # Create a quad face
-                begin
-                  group.entities.add_face(points[i1], points[i2], points[i4], points[i3])
-                rescue StandardError => e
-                  # Skip faces that can't be created (may happen at poles)
-                  log "Skipping face: #{e.message}"
-                end
-              end
-            end
-          end
-          
-          result = { 
-            id: group.entityID,
-            success: true
+        radius = dims[0] / 2.0
+        center = [radius, radius, radius]
+        segments = 16
+        rings = segments / 2
+        ring_pts = []
+        (1...rings).each do |r|
+          lat = Math::PI * r / rings
+          ring_pts << (0...segments).map { |s|
+            lon = 2 * Math::PI * s / segments
+            [center[0] + radius * Math.sin(lat) * Math.cos(lon),
+             center[1] + radius * Math.sin(lat) * Math.sin(lon),
+             center[2] + radius * Math.cos(lat)]
           }
-          log "Created sphere, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating sphere: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        end
+        north = Geom::Point3d.new(center[0], center[1], center[2] + radius)
+        south = Geom::Point3d.new(center[0], center[1], center[2] - radius)
+        (0...segments).each do |s|
+          definition.entities.add_face(north, ring_pts[0][s], ring_pts[0][(s + 1) % segments])
+        end
+        (0...(ring_pts.size - 1)).each do |r|
+          (0...segments).each do |s|
+            s2 = (s + 1) % segments
+            definition.entities.add_face(ring_pts[r][s], ring_pts[r][s2], ring_pts[r + 1][s2], ring_pts[r + 1][s])
+          end
+        end
+        last = ring_pts[-1]
+        (0...segments).each do |s|
+          definition.entities.add_face(south, last[(s + 1) % segments], last[s])
         end
       when "cone"
-        log "Creating cone at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the cone
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          height = dims[2]
-          
-          # Create a circle at the base
-          center = [pos[0] + radius, pos[1] + radius, pos[2]]
-          apex = [center[0], center[1], center[2] + height]
-          
-          # Create points for a circle
-          num_segments = 24  # Number of segments for the circle
-          circle_points = []
-          
-          num_segments.times do |i|
-            angle = Math::PI * 2 * i / num_segments
-            x = center[0] + radius * Math.cos(angle)
-            y = center[1] + radius * Math.sin(angle)
-            z = center[2]
-            circle_points << [x, y, z]
-          end
-          
-          # Create the circular face for the base
-          base = group.entities.add_face(circle_points)
-          
-          # Create the cone sides
-          (0...num_segments).each do |i|
-            j = (i + 1) % num_segments
-            # Create a triangular face from two adjacent points on the circle to the apex
-            group.entities.add_face(circle_points[i], circle_points[j], apex)
-          end
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Created cone, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating cone: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        radius = dims[0] / 2.0
+        height = dims[2]
+        num_segments = 24
+        circle_points = (0...num_segments).map do |i|
+          angle = Math::PI * 2 * i / num_segments
+          [radius + radius * Math.cos(angle), radius + radius * Math.sin(angle), 0]
+        end
+        apex = Geom::Point3d.new(radius, radius, height)
+        definition.entities.add_face(circle_points)
+        (0...num_segments).each do |i|
+          j = (i + 1) % num_segments
+          definition.entities.add_face(circle_points[i], circle_points[j], apex)
         end
       else
         raise "Unknown component type: #{params["type"]}"
       end
+
+      instance = entities.add_instance(
+        definition,
+        Geom::Transformation.translation(Geom::Vector3d.new(pos[0], pos[1], pos[2]))
+      )
+      log "Created #{definition_name} instance ##{instance.entityID}"
+
+      {
+        success: true,
+        id: instance.entityID,
+        definition: definition_name,
+        unit: unit
+      }
     end
 
     def delete_component(params)
@@ -587,6 +547,148 @@ module SU_MCP
       end
       
       { success: true, entities: selected_entities }
+    end
+
+    LENGTH_UNIT_NAMES = {
+      1 => "inches", 2 => "feet", 3 => "millimeters",
+      4 => "centimeters", 5 => "meters"
+    }.freeze
+
+    # Read-only model inspection. Without an id: global summary (entity counts,
+    # bounds, scenes, layers, materials, units, selection). With an id:
+    # details for one entity (bounds, layer, volume, surface area, ...).
+    # Lengths go through Sketchup.format_length so they respect model units.
+    def get_model_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      if params && params["id"]
+        id = params["id"].to_s.gsub('"', '').to_i
+        entity = model.find_entity_by_id(id)
+        raise "Entity not found: #{params['id']}" unless entity
+
+        info = { id: entity.entityID, type: entity.typename }
+        info[:name] = entity.name if entity.respond_to?(:name) && !entity.name.to_s.empty?
+        info[:layer] = entity.layer.name if entity.respond_to?(:layer)
+        info[:hidden] = entity.hidden? if entity.respond_to?(:hidden?)
+        info[:locked] = entity.locked? if entity.respond_to?(:locked?)
+        info[:material] = entity.material.name if entity.respond_to?(:material) && entity.material
+
+        if entity.respond_to?(:bounds) && !entity.bounds.empty?
+          bb = entity.bounds
+          info[:bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+        end
+
+        if entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+          ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+          info[:definition] = entity.definition.name if entity.is_a?(Sketchup::ComponentInstance)
+          faces = ents.grep(Sketchup::Face)
+          info[:faces] = faces.size
+          info[:edges] = ents.grep(Sketchup::Edge).size
+          info[:surface_area] = Sketchup.format_area(faces.sum(&:area))
+          begin
+            info[:volume] = Sketchup.format_volume(entity.volume) if entity.volume > 0
+          rescue
+            # volume raises on non-solids; just omit it
+          end
+        elsif entity.is_a?(Sketchup::Face)
+          info[:area] = Sketchup.format_area(entity.area)
+        end
+
+        return { success: true, result: JSON.pretty_generate(info) }
+      end
+
+      counts = Hash.new(0)
+      model.entities.each { |e| counts[e.typename] += 1 }
+
+      info = {
+        title: model.title,
+        path: model.path,
+        modified: model.modified?,
+        total_entities: model.entities.count,
+        entities_by_type: counts,
+        faces: model.number_faces
+      }
+
+      unless model.bounds.empty?
+        bb = model.bounds
+        info[:model_bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+      end
+
+      info[:scenes] = model.pages.map(&:name)
+      info[:active_scene] = model.pages.selected_page ? model.pages.selected_page.name : nil
+      info[:layers] = model.layers.map(&:name)
+      info[:active_layer] = model.active_layer.name
+      info[:materials] = model.materials.map(&:name)
+      units = model.options["UnitsOptions"]
+      info[:units] = {
+        length: LENGTH_UNIT_NAMES[units["LengthUnit"]] || units["LengthUnit"],
+        precision: units["LengthPrecision"],
+        format: units["LengthFormat"]
+      }
+      selection = model.selection
+      info[:selection_count] = selection.size
+      info[:selection] = selection.to_a.first(20).map do |e|
+        entry = { id: e.entityID, type: e.typename }
+        entry[:name] = e.name if e.respond_to?(:name) && !e.name.to_s.empty?
+        entry
+      end
+
+      { success: true, result: JSON.pretty_generate(info) }
+    end
+
+    # Position the camera by standard view name, or explicit eye/target/up.
+    # All points are in SketchUp internal inches.
+    def set_camera(params)
+      model = Sketchup.active_model
+      view = model.active_view
+      bb = model.bounds
+      center = bb.empty? ? ORIGIN : bb.center
+      perspective = params.fetch("perspective", true)
+
+      if params["eye"] && params["target"]
+        view_name = "custom"
+        eye = Geom::Point3d.new(params["eye"].map(&:to_f))
+        target = Geom::Point3d.new(params["target"].map(&:to_f))
+        up = params["up"] ? Geom::Vector3d.new(params["up"].map(&:to_f)) : Z_AXIS
+      elsif params["standard_view"]
+        view_name = params["standard_view"].to_s.downcase
+        directions = {
+          "top"    => [[0, 0, 1],  [0, 1, 0]],
+          "bottom" => [[0, 0, -1], [0, 1, 0]],
+          "front"  => [[0, -1, 0], [0, 0, 1]],
+          "back"   => [[0, 1, 0],  [0, 0, 1]],
+          "right"  => [[1, 0, 0],  [0, 0, 1]],
+          "left"   => [[-1, 0, 0], [0, 0, 1]],
+          "iso"    => [[1, -1, 1], [0, 0, 1]]
+        }
+        dir_up = directions[view_name]
+        raise "Unknown standard_view '#{view_name}' (use top/bottom/front/back/left/right/iso)" unless dir_up
+        dir = Geom::Vector3d.new(dir_up[0]).normalize
+        dist = bb.empty? ? 100.0 : bb.diagonal * 1.2
+        eye = center.offset(dir, dist)
+        target = center
+        up = Geom::Vector3d.new(dir_up[1])
+      else
+        raise "Provide either standard_view or eye + target"
+      end
+
+      camera = Sketchup::Camera.new(eye, target, up, perspective)
+      camera.fov = params["fov"].to_f if params["fov"]
+      view.camera = camera
+      view.zoom_extents if params["zoom_extents"]
+
+      {
+        success: true,
+        view: view_name,
+        eye: eye.to_a.map { |v| v.round(4) },
+        target: target.to_a.map { |v| v.round(4) },
+        perspective: perspective
+      }
     end
     
     def export_scene(params)
@@ -774,188 +876,77 @@ module SU_MCP
       end
     end
     
+    # Copy an entity's geometry into a fresh solid Group at the same world
+    # position. Group#entities.parent exposes the group's hidden definition,
+    # so the same add_instance path works for groups and component instances.
+    # The nested instance is exploded so the wrapper is a manifold solid,
+    # which the native boolean methods require.
+    def to_solid_group(entity)
+      model = Sketchup.active_model
+      wrapper = model.active_entities.add_group
+      definition = entity.is_a?(Sketchup::Group) ? entity.entities.parent : entity.definition
+      instance = wrapper.entities.add_instance(definition, entity.transformation)
+      instance.explode
+      wrapper
+    end
+
     def boolean_operation(params)
       log "Performing boolean operation with params: #{params.inspect}"
       model = Sketchup.active_model
-      
-      # Get operation type
+
       operation_type = params["operation"]
       unless ["union", "difference", "intersection"].include?(operation_type)
         raise "Invalid boolean operation: #{operation_type}. Must be 'union', 'difference', or 'intersection'."
       end
-      
-      # Get target and tool entities
-      target_id = params["target_id"].to_s.gsub('"', '')
-      tool_id = params["tool_id"].to_s.gsub('"', '')
-      
-      log "Looking for target entity with ID: #{target_id}"
-      target_entity = model.find_entity_by_id(target_id.to_i)
-      
-      log "Looking for tool entity with ID: #{tool_id}"
-      tool_entity = model.find_entity_by_id(tool_id.to_i)
-      
+
+      target_entity = model.find_entity_by_id(params["target_id"].to_s.gsub('"', '').to_i)
+      tool_entity = model.find_entity_by_id(params["tool_id"].to_s.gsub('"', '').to_i)
       unless target_entity && tool_entity
-        missing = []
-        missing << "target" unless target_entity
-        missing << "tool" unless tool_entity
-        raise "Entity not found: #{missing.join(', ')}"
+        raise "Entity not found: #{target_entity ? 'tool' : 'target'}"
       end
-      
-      # Ensure both entities are groups or component instances
+
       unless (target_entity.is_a?(Sketchup::Group) || target_entity.is_a?(Sketchup::ComponentInstance)) &&
              (tool_entity.is_a?(Sketchup::Group) || tool_entity.is_a?(Sketchup::ComponentInstance))
         raise "Boolean operations require groups or component instances"
       end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Perform the boolean operation
-      case operation_type
-      when "union"
-        log "Performing union operation"
-        perform_union(target_entity, tool_entity, result_group)
-      when "difference"
-        log "Performing difference operation"
-        perform_difference(target_entity, tool_entity, result_group)
-      when "intersection"
-        log "Performing intersection operation"
-        perform_intersection(target_entity, tool_entity, result_group)
+
+      model.start_operation("MCP boolean #{operation_type}", true)
+      begin
+        target_group = to_solid_group(target_entity)
+        tool_group = to_solid_group(tool_entity)
+
+        if target_group.volume <= 0
+          raise "Target entity is not a solid (volume is zero)"
+        end
+        if tool_group.volume <= 0
+          raise "Tool entity is not a solid (volume is zero)"
+        end
+
+        # Native solid operations consume both operand groups and return a
+        # new group with the result.
+        result_group = case operation_type
+        when "union"
+          target_group.union(tool_group)
+        when "difference"
+          target_group.subtract(tool_group)
+        when "intersection"
+          target_group.intersect(tool_group)
+        end
+        raise "#{operation_type} failed" unless result_group
+
+        if params["delete_originals"]
+          target_entity.erase! if target_entity.valid?
+          tool_entity.erase! if tool_entity.valid?
+        end
+
+        model.commit_operation
+        { success: true, id: result_group.entityID }
+      rescue Exception
+        model.abort_operation
+        raise
       end
-      
-      # Clean up original entities if requested
-      if params["delete_originals"]
-        target_entity.erase! if target_entity.valid?
-        tool_entity.erase! if tool_entity.valid?
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: result_group.entityID
-      }
     end
-    
-    def perform_union(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Copy all entities from tool to result
-      tool_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Clean up temporary copies
-      target_copy.erase!
-      tool_copy.erase!
-      
-      # Outer shell - this will merge overlapping geometry
-      result_group.entities.outer_shell
-    end
-    
-    def perform_difference(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Create a temporary group for the tool
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from tool to temp group
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Subtract the tool from the result
-      result_group.entities.subtract(temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_tool_group.erase!
-    end
-    
-    def perform_intersection(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Create temporary groups for target and tool
-      temp_target_group = model.active_entities.add_group
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from target and tool to temp groups
-      target_entities.each do |entity|
-        entity.copy(temp_target_group.entities)
-      end
-      
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Perform the intersection
-      result_group.entities.intersect_with(temp_target_group.entities, temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_target_group.erase!
-      temp_tool_group.erase!
-    end
-    
+
     def chamfer_edges(params)
       log "Chamfering edges with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -1825,25 +1816,32 @@ module SU_MCP
     
     def eval_ruby(params)
       log "Evaluating Ruby code with length: #{params['code'].length}"
-      
+
+      model = Sketchup.active_model
+      # Wrap mutations in an undoable operation so a failing script doesn't
+      # leave the model half-modified.
+      op_open = false
+      if model
+        model.start_operation("MCP eval_ruby", true)
+        op_open = true
+      end
+
       begin
-        # Create a safe binding for evaluation
-        binding = TOPLEVEL_BINDING.dup
-        
-        # Evaluate the Ruby code
-        log "Starting code evaluation..."
-        result = eval(params["code"], binding)
+        result = eval(params["code"], TOPLEVEL_BINDING.dup)
         log "Code evaluation completed with result: #{result.inspect}"
-        
-        # Return success with the result as a string
-        { 
+        model.commit_operation if op_open
+        {
           success: true,
           result: result.to_s
         }
-      rescue StandardError => e
-        log "Error in eval_ruby: #{e.message}"
-        log e.backtrace.join("\n")
-        raise "Ruby evaluation error: #{e.message}"
+      rescue Exception => e
+        # Rescue Exception, not just StandardError: SyntaxError (a ScriptError)
+        # and friends escape a plain StandardError rescue and used to kill the
+        # request without any response ever being sent back to the client.
+        model.abort_operation if op_open
+        log "Error in eval_ruby: #{e.class}: #{e.message}"
+        log e.backtrace.join("\n") if e.backtrace
+        raise "Ruby evaluation error: #{e.class}: #{e.message}"
       end
     end
   end

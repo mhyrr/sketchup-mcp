@@ -62,14 +62,20 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
-* `get_scene_info` - Gets information about the current Sketchup scene
-* `get_selected_components` - Gets information about currently selected components
-* `create_component` - Create a new component with specified parameters
-* `delete_component` - Remove a component from the scene
+* `get_model_info` - Inspect the model: entity counts by type, bounds, scenes, layers, materials, units, selection. Pass an entity id for per-entity details (bounds, volume, surface area, face/edge counts). Read-only
+* `create_component` - Create a new component (`cube`, `cylinder`, `sphere` or `cone`) at a position with given dimensions. Use `unit` (`inch` default, `mm`, `cm`, `m`) to control the unit of position/dimensions; the result is a real component instance, not loose geometry
+* `delete_component` - Remove a component from the scene by entity ID
 * `transform_component` - Move, rotate, or scale a component
-* `set_material` - Apply materials to components
-* `export_scene` - Export the current scene to various formats
-* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
+* `get_selection` - Get currently selected entities
+* `set_camera` - Position the camera by standard view (`top`/`front`/`iso`/...) or explicit eye/target/up, with fov and perspective control; pair with `export_scene` to capture from the new viewpoint
+* `set_material` - Apply a material/color to a component (named colors or `#RRGGBB`)
+* `boolean_operation` - Solid `union`/`difference`/`intersection` between two groups or component instances, via SketchUp's native solid operations. Operates on copies; `delete_originals` also removes the source entities
+* `export_scene` - Export the scene to `skp`, `obj`, `dae`, `stl`, `png` or `jpg`. Image exports accept `width`/`height` and the response reports the `path` of the exported file (in the system temp directory), so it can be read directly by the client
+* `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations (saving, layers, scenes, import, follow-me, shadows, ... — see the tool description for recipes). Each evaluation runs inside an undoable operation; if the code raises, the changes are rolled back
+
+#### Known limitations
+
+The joint tools (`create_mortise_tenon`, `create_dovetail`, `create_finger_joint`) and the Ruby-side `chamfer_edges`/`fillet_edges` handlers predate the current bridge and call long-removed APIs (`Entity#copy`, `Entities#subtract`); they fail with a clean error until rewritten.
 
 ### Example Commands
 
