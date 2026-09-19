@@ -2,6 +2,7 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'tmpdir'
 
 puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
@@ -37,6 +38,7 @@ module SU_MCP
 
     def start
       return if @running
+      @start_time = Time.now
       
       begin
         log "Starting server on localhost:#{@port}..."
@@ -47,6 +49,7 @@ module SU_MCP
         @running = true
         
         @timer_id = UI.start_timer(0.1, true) {
+          client = nil
           begin
             if @running
               # Check for connection
@@ -55,69 +58,40 @@ module SU_MCP
                 log "Connection waiting..."
                 client = @server.accept_nonblock
                 log "Client accepted"
-                
-                data = client.gets
+
+                # Never block the main thread waiting for input: a client that
+                # connects and stays idle (e.g. a warm-up/health-check socket)
+                # is dropped after a short deadline instead of freezing SketchUp.
+                data = read_request(client)
                 log "Raw data: #{data.inspect}"
-                
+
                 if data
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  end
+                  respond_to_request(client, data)
                 end
-                
-                client.close
+
                 log "Client closed"
               end
             end
           rescue IO::WaitReadable
             # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
+          rescue Exception => e
+            # Rescue Exception, not just StandardError: bridge requests may
+            # raise SyntaxError/SystemStackError/etc., and letting those escape
+            # used to leave the client without any response until it timed out.
+            log "Timer error: #{e.class}: #{e.message}"
+            log e.backtrace.join("\n") if e.backtrace
+            begin
+              client.write({
+                jsonrpc: "2.0",
+                error: { code: -32603, message: "#{e.class}: #{e.message}" },
+                id: nil
+              }.to_json + "\n")
+              client.flush
+            rescue Exception
+              # Client is gone; nothing else we can do.
+            end
+          ensure
+            client.close if client && !client.closed?
           end
         }
         
@@ -145,6 +119,62 @@ module SU_MCP
     end
 
     private
+
+    # Read one newline-terminated request without ever blocking indefinitely.
+    # Returns nil when the client sends nothing before the deadline.
+    def read_request(client, deadline_seconds = 2)
+      buffer = "".dup
+      deadline = Time.now + deadline_seconds
+      while (remaining = deadline - Time.now) > 0
+        ready = IO.select([client], nil, nil, remaining)
+        break unless ready
+        begin
+          chunk = client.read_nonblock(65_536)
+          buffer << chunk
+          break if buffer.include?("\n")
+        rescue IO::WaitReadable
+          retry
+        rescue EOFError, Errno::ECONNRESET
+          break
+        end
+      end
+      buffer.include?("\n") ? buffer : nil
+    end
+
+    # Parse the request and always write exactly one response, even when
+    # handling raises an unexpected exception class.
+    def respond_to_request(client, data)
+      original_id = nil
+      if data =~ /"id":\s*(\d+)/
+        original_id = $1.to_i
+        log "Found original request ID: #{original_id}"
+      end
+
+      begin
+        request = JSON.parse(data)
+        request["id"] = original_id if !request["id"] && original_id
+        response = handle_jsonrpc_request(request)
+      rescue JSON::ParserError => e
+        log "JSON parse error: #{e.message}"
+        response = {
+          jsonrpc: "2.0",
+          error: { code: -32700, message: "Parse error: #{e.message}" },
+          id: original_id
+        }
+      rescue Exception => e
+        log "Request error: #{e.class}: #{e.message}"
+        response = {
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "#{e.class}: #{e.message}" },
+          id: original_id
+        }
+      end
+
+      response_json = response.to_json + "\n"
+      client.write(response_json)
+      client.flush
+      log "Response sent"
+    end
 
     def handle_jsonrpc_request(request)
       log "Handling JSONRPC request: #{request.inspect}"
@@ -226,16 +256,24 @@ module SU_MCP
           transform_component(args)
         when "get_selection"
           get_selection
+        when "get_model_info"
+          get_model_info(args)
+        when "set_camera"
+          set_camera(args)
+        when "get_viewport_screenshot"
+          get_viewport_screenshot(args)
+        when "get_addon_status"
+          get_addon_status(args)
+        when "set_texture"
+          set_texture(args)
+        when "import_file"
+          import_file(args)
         when "export", "export_scene"
           export_scene(args)
         when "set_material"
           set_material(args)
         when "boolean_operation"
           boolean_operation(args)
-        when "chamfer_edges"
-          chamfer_edges(args)
-        when "fillet_edges"
-          fillet_edges(args)
         when "create_mortise_tenon"
           create_mortise_tenon(args)
         when "create_dovetail"
@@ -250,14 +288,21 @@ module SU_MCP
 
         log "Tool call result: #{result.inspect}"
         if result[:success]
+          # Surface tool-specific fields (export path/format, joint ids,
+          # selection entities, ...) instead of dropping them.
+          extras = result.reject { |k, _| [:success, :result, :id].include?(k) }
+          text = result[:result]
+          if text.nil?
+            text = extras.empty? ? "Success" : extras.map { |k, v| "#{k}: #{v}" }.join("; ")
+          end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: {
-              content: [{ type: "text", text: result[:result] || "Success" }],
+              content: [{ type: "text", text: text }],
               isError: false,
               success: true,
               resourceId: result[:id]
-            },
+            }.merge(extras),
             id: request["id"]
           }
           log "Sending success response: #{response.inspect}"
@@ -291,202 +336,122 @@ module SU_MCP
       end
     end
 
+    # SketchUp's internal length unit is the inch; convert user-supplied
+    # values so tools can work in mm/cm/m without mental math.
+    UNIT_TO_INCH = {
+      "inch" => 1.0,
+      "in"   => 1.0,
+      "mm"   => 1.0 / 25.4,
+      "cm"   => 1.0 / 2.54,
+      "m"    => 100.0 / 2.54
+    }.freeze
+
     def create_component(params)
       log "Creating component with params: #{params.inspect}"
       model = Sketchup.active_model
-      log "Got active model: #{model.inspect}"
       entities = model.active_entities
-      log "Got active entities: #{entities.inspect}"
-      
+
       pos = params["position"] || [0,0,0]
       dims = params["dimensions"] || [1,1,1]
-      
+      unit = (params["unit"] || "inch").to_s.downcase
+      factor = UNIT_TO_INCH[unit]
+      raise "Unknown unit: #{unit.inspect} (supported: inch, mm, cm, m)" unless factor
+      pos = pos.map { |v| v.to_f * factor }
+      dims = dims.map { |v| v.to_f * factor }
+
+      # Build the geometry at the origin of a component definition, then place
+      # one instance at the requested position, so callers get a real reusable
+      # component instead of loose grouped geometry.
+      base_name = "MCP #{params["type"].to_s.capitalize}"
+      definition_name = base_name
+      n = 2
+      while model.definitions[definition_name]
+        definition_name = "#{base_name} #{n}"
+        n += 1
+      end
+      definition = model.definitions.add(definition_name)
+
       case params["type"]
       when "cube"
-        log "Creating cube at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          group = entities.add_group
-          log "Created group: #{group.inspect}"
-          
-          face = group.entities.add_face(
-            [pos[0], pos[1], pos[2]],
-            [pos[0] + dims[0], pos[1], pos[2]],
-            [pos[0] + dims[0], pos[1] + dims[1], pos[2]],
-            [pos[0], pos[1] + dims[1], pos[2]]
-          )
-          log "Created face: #{face.inspect}"
-          
-          face.pushpull(dims[2])
-          log "Pushed/pulled face by #{dims[2]}"
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error in create_component: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
-        end
+        face = definition.entities.add_face(
+          [0, 0, 0],
+          [dims[0], 0, 0],
+          [dims[0], dims[1], 0],
+          [0, dims[1], 0]
+        )
+        face.reverse! if face.normal.z < 0
+        face.pushpull(dims[2])
       when "cylinder"
-        log "Creating cylinder at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the cylinder
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          height = dims[2]
-          
-          # Create a circle at the base
-          center = [pos[0] + radius, pos[1] + radius, pos[2]]
-          
-          # Create points for a circle
-          num_segments = 24  # Number of segments for the circle
-          circle_points = []
-          
-          num_segments.times do |i|
-            angle = Math::PI * 2 * i / num_segments
-            x = center[0] + radius * Math.cos(angle)
-            y = center[1] + radius * Math.sin(angle)
-            z = center[2]
-            circle_points << [x, y, z]
-          end
-          
-          # Create the circular face
-          face = group.entities.add_face(circle_points)
-          
-          # Extrude the face to create the cylinder
-          face.pushpull(height)
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Created cylinder, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating cylinder: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        radius = dims[0] / 2.0
+        height = dims[2]
+        num_segments = 24
+        circle_points = (0...num_segments).map do |i|
+          angle = Math::PI * 2 * i / num_segments
+          [radius + radius * Math.cos(angle), radius + radius * Math.sin(angle), 0]
         end
+        face = definition.entities.add_face(circle_points)
+        face.reverse! if face.normal.z < 0
+        face.pushpull(height)
       when "sphere"
-        log "Creating sphere at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the sphere
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          center = [pos[0] + radius, pos[1] + radius, pos[2] + radius]
-          
-          # Use SketchUp's built-in sphere method if available
-          if Sketchup::Tools.respond_to?(:create_sphere)
-            Sketchup::Tools.create_sphere(center, radius, 24, group.entities)
-          else
-            # Fallback implementation using polygons
-            # Create a UV sphere with latitude and longitude segments
-            segments = 16
-            
-            # Create points for the sphere
-            points = []
-            for lat_i in 0..segments
-              lat = Math::PI * lat_i / segments
-              for lon_i in 0..segments
-                lon = 2 * Math::PI * lon_i / segments
-                x = center[0] + radius * Math.sin(lat) * Math.cos(lon)
-                y = center[1] + radius * Math.sin(lat) * Math.sin(lon)
-                z = center[2] + radius * Math.cos(lat)
-                points << [x, y, z]
-              end
-            end
-            
-            # Create faces for the sphere (simplified approach)
-            for lat_i in 0...segments
-              for lon_i in 0...segments
-                i1 = lat_i * (segments + 1) + lon_i
-                i2 = i1 + 1
-                i3 = i1 + segments + 1
-                i4 = i3 + 1
-                
-                # Create a quad face
-                begin
-                  group.entities.add_face(points[i1], points[i2], points[i4], points[i3])
-                rescue StandardError => e
-                  # Skip faces that can't be created (may happen at poles)
-                  log "Skipping face: #{e.message}"
-                end
-              end
-            end
-          end
-          
-          result = { 
-            id: group.entityID,
-            success: true
+        radius = dims[0] / 2.0
+        center = [radius, radius, radius]
+        segments = 16
+        rings = segments / 2
+        ring_pts = []
+        (1...rings).each do |r|
+          lat = Math::PI * r / rings
+          ring_pts << (0...segments).map { |s|
+            lon = 2 * Math::PI * s / segments
+            [center[0] + radius * Math.sin(lat) * Math.cos(lon),
+             center[1] + radius * Math.sin(lat) * Math.sin(lon),
+             center[2] + radius * Math.cos(lat)]
           }
-          log "Created sphere, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating sphere: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        end
+        north = Geom::Point3d.new(center[0], center[1], center[2] + radius)
+        south = Geom::Point3d.new(center[0], center[1], center[2] - radius)
+        (0...segments).each do |s|
+          definition.entities.add_face(north, ring_pts[0][s], ring_pts[0][(s + 1) % segments])
+        end
+        (0...(ring_pts.size - 1)).each do |r|
+          (0...segments).each do |s|
+            s2 = (s + 1) % segments
+            definition.entities.add_face(ring_pts[r][s], ring_pts[r][s2], ring_pts[r + 1][s2], ring_pts[r + 1][s])
+          end
+        end
+        last = ring_pts[-1]
+        (0...segments).each do |s|
+          definition.entities.add_face(south, last[(s + 1) % segments], last[s])
         end
       when "cone"
-        log "Creating cone at position #{pos.inspect} with dimensions #{dims.inspect}"
-        
-        begin
-          # Create a group to contain the cone
-          group = entities.add_group
-          
-          # Extract dimensions
-          radius = dims[0] / 2.0
-          height = dims[2]
-          
-          # Create a circle at the base
-          center = [pos[0] + radius, pos[1] + radius, pos[2]]
-          apex = [center[0], center[1], center[2] + height]
-          
-          # Create points for a circle
-          num_segments = 24  # Number of segments for the circle
-          circle_points = []
-          
-          num_segments.times do |i|
-            angle = Math::PI * 2 * i / num_segments
-            x = center[0] + radius * Math.cos(angle)
-            y = center[1] + radius * Math.sin(angle)
-            z = center[2]
-            circle_points << [x, y, z]
-          end
-          
-          # Create the circular face for the base
-          base = group.entities.add_face(circle_points)
-          
-          # Create the cone sides
-          (0...num_segments).each do |i|
-            j = (i + 1) % num_segments
-            # Create a triangular face from two adjacent points on the circle to the apex
-            group.entities.add_face(circle_points[i], circle_points[j], apex)
-          end
-          
-          result = { 
-            id: group.entityID,
-            success: true
-          }
-          log "Created cone, returning result: #{result.inspect}"
-          result
-        rescue StandardError => e
-          log "Error creating cone: #{e.message}"
-          log e.backtrace.join("\n")
-          raise
+        radius = dims[0] / 2.0
+        height = dims[2]
+        num_segments = 24
+        circle_points = (0...num_segments).map do |i|
+          angle = Math::PI * 2 * i / num_segments
+          [radius + radius * Math.cos(angle), radius + radius * Math.sin(angle), 0]
+        end
+        apex = Geom::Point3d.new(radius, radius, height)
+        definition.entities.add_face(circle_points)
+        (0...num_segments).each do |i|
+          j = (i + 1) % num_segments
+          definition.entities.add_face(circle_points[i], circle_points[j], apex)
         end
       else
         raise "Unknown component type: #{params["type"]}"
       end
+
+      instance = entities.add_instance(
+        definition,
+        Geom::Transformation.translation(Geom::Vector3d.new(pos[0], pos[1], pos[2]))
+      )
+      log "Created #{definition_name} instance ##{instance.entityID}"
+
+      {
+        success: true,
+        id: instance.entityID,
+        definition: definition_name,
+        unit: unit
+      }
     end
 
     def delete_component(params)
@@ -588,7 +553,229 @@ module SU_MCP
       
       { success: true, entities: selected_entities }
     end
+
+    LENGTH_UNIT_NAMES = {
+      1 => "inches", 2 => "feet", 3 => "millimeters",
+      4 => "centimeters", 5 => "meters"
+    }.freeze
+
+    # Read-only model inspection. Without an id: global summary (entity counts,
+    # bounds, scenes, layers, materials, units, selection). With an id:
+    # details for one entity (bounds, layer, volume, surface area, ...).
+    # Lengths go through Sketchup.format_length so they respect model units.
+    def get_model_info(params)
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      if params && params["id"]
+        id = params["id"].to_s.gsub('"', '').to_i
+        entity = model.find_entity_by_id(id)
+        raise "Entity not found: #{params['id']}" unless entity
+
+        info = { id: entity.entityID, type: entity.typename }
+        info[:name] = entity.name if entity.respond_to?(:name) && !entity.name.to_s.empty?
+        info[:layer] = entity.layer.name if entity.respond_to?(:layer)
+        info[:hidden] = entity.hidden? if entity.respond_to?(:hidden?)
+        info[:locked] = entity.locked? if entity.respond_to?(:locked?)
+        info[:material] = entity.material.name if entity.respond_to?(:material) && entity.material
+
+        if entity.respond_to?(:bounds) && !entity.bounds.empty?
+          bb = entity.bounds
+          info[:bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+          info[:bounds_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+        end
+
+        if entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
+          ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+          info[:definition] = entity.definition.name if entity.is_a?(Sketchup::ComponentInstance)
+          faces = ents.grep(Sketchup::Face)
+          info[:faces] = faces.size
+          info[:edges] = ents.grep(Sketchup::Edge).size
+          info[:surface_area] = Sketchup.format_area(faces.sum(&:area))
+          begin
+            info[:volume] = Sketchup.format_volume(entity.volume) if entity.volume > 0
+          rescue
+            # volume raises on non-solids; just omit it
+          end
+        elsif entity.is_a?(Sketchup::Face)
+          info[:area] = Sketchup.format_area(entity.area)
+        end
+
+        return { success: true, result: JSON.pretty_generate(info) }
+      end
+
+      counts = Hash.new(0)
+      model.entities.each { |e| counts[e.typename] += 1 }
+
+      info = {
+        title: model.title,
+        path: model.path,
+        modified: model.modified?,
+        total_entities: model.entities.count,
+        entities_by_type: counts,
+        faces: model.number_faces
+      }
+
+      unless model.bounds.empty?
+        bb = model.bounds
+        info[:model_bounds_min] = bb.min.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_bounds_max] = bb.max.to_a.map { |v| Sketchup.format_length(v) }
+        info[:model_size] = [bb.width, bb.depth, bb.height].map { |v| Sketchup.format_length(v) }
+      end
+
+      info[:scenes] = model.pages.map(&:name)
+      info[:active_scene] = model.pages.selected_page ? model.pages.selected_page.name : nil
+      info[:layers] = model.layers.map(&:name)
+      info[:active_layer] = model.active_layer.name
+      info[:materials] = model.materials.map(&:name)
+      units = model.options["UnitsOptions"]
+      info[:units] = {
+        length: LENGTH_UNIT_NAMES[units["LengthUnit"]] || units["LengthUnit"],
+        precision: units["LengthPrecision"],
+        format: units["LengthFormat"]
+      }
+      selection = model.selection
+      info[:selection_count] = selection.size
+      info[:selection] = selection.to_a.first(20).map do |e|
+        entry = { id: e.entityID, type: e.typename }
+        entry[:name] = e.name if e.respond_to?(:name) && !e.name.to_s.empty?
+        entry
+      end
+
+      { success: true, result: JSON.pretty_generate(info) }
+    end
+
+    # Position the camera by standard view name, or explicit eye/target/up.
+    # All points are in SketchUp internal inches.
+    def set_camera(params)
+      model = Sketchup.active_model
+      view = model.active_view
+      bb = model.bounds
+      center = bb.empty? ? ORIGIN : bb.center
+      perspective = params.fetch("perspective", true)
+
+      if params["eye"] && params["target"]
+        view_name = "custom"
+        eye = Geom::Point3d.new(params["eye"].map(&:to_f))
+        target = Geom::Point3d.new(params["target"].map(&:to_f))
+        up = params["up"] ? Geom::Vector3d.new(params["up"].map(&:to_f)) : Z_AXIS
+      elsif params["standard_view"]
+        view_name = params["standard_view"].to_s.downcase
+        directions = {
+          "top"    => [[0, 0, 1],  [0, 1, 0]],
+          "bottom" => [[0, 0, -1], [0, 1, 0]],
+          "front"  => [[0, -1, 0], [0, 0, 1]],
+          "back"   => [[0, 1, 0],  [0, 0, 1]],
+          "right"  => [[1, 0, 0],  [0, 0, 1]],
+          "left"   => [[-1, 0, 0], [0, 0, 1]],
+          "iso"    => [[1, -1, 1], [0, 0, 1]]
+        }
+        dir_up = directions[view_name]
+        raise "Unknown standard_view '#{view_name}' (use top/bottom/front/back/left/right/iso)" unless dir_up
+        dir = Geom::Vector3d.new(dir_up[0]).normalize
+        dist = bb.empty? ? 100.0 : bb.diagonal * 1.2
+        eye = center.offset(dir, dist)
+        target = center
+        up = Geom::Vector3d.new(dir_up[1])
+      else
+        raise "Provide either standard_view or eye + target"
+      end
+
+      camera = Sketchup::Camera.new(eye, target, up, perspective)
+      camera.fov = params["fov"].to_f if params["fov"]
+      view.camera = camera
+      view.zoom_extents if params["zoom_extents"]
+
+      {
+        success: true,
+        view: view_name,
+        eye: eye.to_a.map { |v| v.round(4) },
+        target: target.to_a.map { |v| v.round(4) },
+        perspective: perspective
+      }
+    end
     
+    # Lightweight health check for the bridge: versions and model state
+    # without touching geometry.
+    def get_addon_status(params)
+      model = Sketchup.active_model
+      status = {
+        sketchup_version: Sketchup.version.to_s,
+        platform: Sketchup.platform.to_s,
+        pro: Sketchup.is_pro?,
+        model_title: model.title,
+        model_path: model.path,
+        entities: model.entities.count,
+        server_port: @port,
+        ruby_version: RUBY_VERSION,
+        uptime_seconds: @start_time ? (Time.now - @start_time).round : nil
+      }
+      { success: true, result: JSON.generate(status) }
+    end
+
+    # Apply an image file as a texture-mapped material on an entity.
+    # size is the repeat length in inches (SketchUp texture tiling).
+    def set_texture(params)
+      model = Sketchup.active_model
+      texture_path = params["texture_path"].to_s
+      raise "texture_path required" if texture_path.empty?
+      raise "Texture file not found: #{texture_path}" unless File.exist?(texture_path)
+
+      entity = model.find_entity_by_id(params["id"].to_s.gsub('"', '').to_i)
+      raise "Entity not found" unless entity
+
+      material_name = params["material_name"] || File.basename(texture_path, ".*")
+      material = model.materials[material_name] || model.materials.add(material_name)
+      material.texture = texture_path
+      material.texture.size = params["size"].to_f if params["size"] && params["size"].to_f > 0
+
+      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      faces = entities.grep(Sketchup::Face)
+      raise "Entity has no faces to texture" if faces.empty?
+      faces.each { |face| face.material = material }
+
+      { success: true, id: entity.entityID, material: material_name,
+        textured_faces: faces.size }
+    end
+
+    # Import any file SketchUp supports (glb/gltb, obj, dae, stl, 3ds, dwg,
+    # dxf, ifc, kmz, images, ...). GLB imports keep embedded textures.
+    def import_file(params)
+      model = Sketchup.active_model
+      filepath = params["filepath"].to_s
+      raise "filepath required" if filepath.empty?
+      raise "File not found: #{filepath}" unless File.exist?(filepath)
+
+      before = model.entities.map(&:entityID)
+      imported = model.import(filepath, false)
+      raise "SketchUp importer rejected the file" unless imported
+      new_entities = model.entities.to_a.select { |e| !before.include?(e.entityID) }
+
+      { success: true, path: filepath,
+        count: new_entities.size,
+        ids: new_entities.map(&:entityID) }
+    end
+
+    # Write a PNG of the current viewport to a caller-provided path. The
+    # Python side passes a temp file, reads the bytes back and returns them
+    # as an MCP image block, so the agent sees the viewport directly.
+    def get_viewport_screenshot(params)
+      model = Sketchup.active_model
+      filepath = params["filepath"].to_s
+      raise "filepath required" if filepath.empty?
+
+      view = model.active_view
+      ok = view.write_image(
+        filename: filepath,
+        width: (params["width"] || 1600).to_i,
+        height: (params["height"] || 900).to_i,
+        antialias: true
+      )
+      raise "write_image failed" unless ok
+      { success: true, path: filepath }
+    end
+
     def export_scene(params)
       log "Exporting scene with params: #{params.inspect}"
       model = Sketchup.active_model
@@ -603,17 +790,31 @@ module SU_MCP
         # Generate a unique filename
         timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
         filename = "sketchup_export_#{timestamp}"
+
+        # Caller-provided destination wins over the temp dir.
+        custom_path = params["filepath"].to_s
+        unless custom_path.empty?
+          dir = File.dirname(custom_path)
+          FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+        end
         
         case format.downcase
         when "skp"
           # Export as SketchUp file
-          export_path = File.join(temp_dir, "#{filename}.skp")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.skp") : custom_path
           log "Exporting to SketchUp file: #{export_path}"
-          model.save(export_path)
+          begin
+            # save_copy keeps the working model's own path binding intact;
+            # it requires the model to have been saved once, so unsaved
+            # models fall back to save (which binds the export path).
+            model.save_copy(export_path)
+          rescue ArgumentError
+            model.save(export_path)
+          end
           
         when "obj"
           # Export as OBJ file
-          export_path = File.join(temp_dir, "#{filename}.obj")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.obj") : custom_path
           log "Exporting to OBJ file: #{export_path}"
           
           # Check if OBJ exporter is available
@@ -631,7 +832,7 @@ module SU_MCP
           
         when "dae"
           # Export as COLLADA file
-          export_path = File.join(temp_dir, "#{filename}.dae")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.dae") : custom_path
           log "Exporting to COLLADA file: #{export_path}"
           
           # Check if COLLADA exporter is available
@@ -644,7 +845,7 @@ module SU_MCP
           
         when "stl"
           # Export as STL file
-          export_path = File.join(temp_dir, "#{filename}.stl")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.stl") : custom_path
           log "Exporting to STL file: #{export_path}"
           
           # Check if STL exporter is available
@@ -658,7 +859,7 @@ module SU_MCP
         when "png", "jpg", "jpeg"
           # Export as image
           ext = format.downcase == "jpg" ? "jpeg" : format.downcase
-          export_path = File.join(temp_dir, "#{filename}.#{ext}")
+          export_path = custom_path.empty? ? File.join(temp_dir, "#{filename}.#{ext}") : custom_path
           log "Exporting to image file: #{export_path}"
           
           # Get the current view
@@ -774,1076 +975,429 @@ module SU_MCP
       end
     end
     
+    # Copy an entity's geometry into a fresh solid Group at the same world
+    # position. Group#entities.parent exposes the group's hidden definition,
+    # so the same add_instance path works for groups and component instances.
+    # The nested instance is exploded so the wrapper is a manifold solid,
+    # which the native boolean methods require.
+    def to_solid_group(entity)
+      model = Sketchup.active_model
+      wrapper = model.active_entities.add_group
+      definition = entity.is_a?(Sketchup::Group) ? entity.entities.parent : entity.definition
+      instance = wrapper.entities.add_instance(definition, entity.transformation)
+      instance.explode
+      wrapper
+    end
+
     def boolean_operation(params)
       log "Performing boolean operation with params: #{params.inspect}"
       model = Sketchup.active_model
-      
-      # Get operation type
+
       operation_type = params["operation"]
       unless ["union", "difference", "intersection"].include?(operation_type)
         raise "Invalid boolean operation: #{operation_type}. Must be 'union', 'difference', or 'intersection'."
       end
-      
-      # Get target and tool entities
-      target_id = params["target_id"].to_s.gsub('"', '')
-      tool_id = params["tool_id"].to_s.gsub('"', '')
-      
-      log "Looking for target entity with ID: #{target_id}"
-      target_entity = model.find_entity_by_id(target_id.to_i)
-      
-      log "Looking for tool entity with ID: #{tool_id}"
-      tool_entity = model.find_entity_by_id(tool_id.to_i)
-      
+
+      target_entity = model.find_entity_by_id(params["target_id"].to_s.gsub('"', '').to_i)
+      tool_entity = model.find_entity_by_id(params["tool_id"].to_s.gsub('"', '').to_i)
       unless target_entity && tool_entity
-        missing = []
-        missing << "target" unless target_entity
-        missing << "tool" unless tool_entity
-        raise "Entity not found: #{missing.join(', ')}"
+        raise "Entity not found: #{target_entity ? 'tool' : 'target'}"
       end
-      
-      # Ensure both entities are groups or component instances
+
       unless (target_entity.is_a?(Sketchup::Group) || target_entity.is_a?(Sketchup::ComponentInstance)) &&
              (tool_entity.is_a?(Sketchup::Group) || tool_entity.is_a?(Sketchup::ComponentInstance))
         raise "Boolean operations require groups or component instances"
       end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Perform the boolean operation
-      case operation_type
-      when "union"
-        log "Performing union operation"
-        perform_union(target_entity, tool_entity, result_group)
-      when "difference"
-        log "Performing difference operation"
-        perform_difference(target_entity, tool_entity, result_group)
-      when "intersection"
-        log "Performing intersection operation"
-        perform_intersection(target_entity, tool_entity, result_group)
-      end
-      
-      # Clean up original entities if requested
-      if params["delete_originals"]
-        target_entity.erase! if target_entity.valid?
-        tool_entity.erase! if tool_entity.valid?
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: result_group.entityID
-      }
-    end
-    
-    def perform_union(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Copy all entities from tool to result
-      tool_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Clean up temporary copies
-      target_copy.erase!
-      tool_copy.erase!
-      
-      # Outer shell - this will merge overlapping geometry
-      result_group.entities.outer_shell
-    end
-    
-    def perform_difference(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Copy all entities from target to result
-      target_entities.each do |entity|
-        entity.copy(result_group.entities)
-      end
-      
-      # Create a temporary group for the tool
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from tool to temp group
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Subtract the tool from the result
-      result_group.entities.subtract(temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_tool_group.erase!
-    end
-    
-    def perform_intersection(target, tool, result_group)
-      model = Sketchup.active_model
-      
-      # Create temporary copies of the target and tool
-      target_copy = target.copy
-      tool_copy = tool.copy
-      
-      # Get the transformation of each entity
-      target_transform = target.transformation
-      tool_transform = tool.transformation
-      
-      # Apply the transformations to the copies
-      target_copy.transform!(target_transform)
-      tool_copy.transform!(tool_transform)
-      
-      # Get the entities from the copies
-      target_entities = target_copy.is_a?(Sketchup::Group) ? target_copy.entities : target_copy.definition.entities
-      tool_entities = tool_copy.is_a?(Sketchup::Group) ? tool_copy.entities : tool_copy.definition.entities
-      
-      # Create temporary groups for target and tool
-      temp_target_group = model.active_entities.add_group
-      temp_tool_group = model.active_entities.add_group
-      
-      # Copy all entities from target and tool to temp groups
-      target_entities.each do |entity|
-        entity.copy(temp_target_group.entities)
-      end
-      
-      tool_entities.each do |entity|
-        entity.copy(temp_tool_group.entities)
-      end
-      
-      # Perform the intersection
-      result_group.entities.intersect_with(temp_target_group.entities, temp_tool_group.entities)
-      
-      # Clean up temporary copies and groups
-      target_copy.erase!
-      tool_copy.erase!
-      temp_target_group.erase!
-      temp_tool_group.erase!
-    end
-    
-    def chamfer_edges(params)
-      log "Chamfering edges with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get entity ID
-      entity_id = params["entity_id"].to_s.gsub('"', '')
-      log "Looking for entity with ID: #{entity_id}"
-      
-      entity = model.find_entity_by_id(entity_id.to_i)
-      unless entity
-        raise "Entity not found: #{entity_id}"
-      end
-      
-      # Ensure entity is a group or component instance
-      unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
-        raise "Chamfer operation requires a group or component instance"
-      end
-      
-      # Get the distance parameter
-      distance = params["distance"] || 0.5
-      
-      # Get the entities collection
-      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
-      
-      # Find all edges in the entity
-      edges = entities.grep(Sketchup::Edge)
-      
-      # If specific edges are provided, filter the edges
-      if params["edge_indices"] && params["edge_indices"].is_a?(Array)
-        edge_indices = params["edge_indices"]
-        edges = edges.select.with_index { |_, i| edge_indices.include?(i) }
-      end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Copy all entities from the original to the result
-      entities.each do |e|
-        e.copy(result_group.entities)
-      end
-      
-      # Get the edges in the result group
-      result_edges = result_group.entities.grep(Sketchup::Edge)
-      
-      # If specific edges were provided, filter the result edges
-      if params["edge_indices"] && params["edge_indices"].is_a?(Array)
-        edge_indices = params["edge_indices"]
-        result_edges = result_edges.select.with_index { |_, i| edge_indices.include?(i) }
-      end
-      
-      # Perform the chamfer operation
+
+      model.start_operation("MCP boolean #{operation_type}", true)
       begin
-        # Create a transformation for the chamfer
-        chamfer_transform = Geom::Transformation.scaling(1.0 - distance)
-        
-        # For each edge, create a chamfer
-        result_edges.each do |edge|
-          # Get the faces connected to this edge
-          faces = edge.faces
-          next if faces.length < 2
-          
-          # Get the start and end points of the edge
-          start_point = edge.start.position
-          end_point = edge.end.position
-          
-          # Calculate the midpoint of the edge
-          midpoint = Geom::Point3d.new(
-            (start_point.x + end_point.x) / 2.0,
-            (start_point.y + end_point.y) / 2.0,
-            (start_point.z + end_point.z) / 2.0
-          )
-          
-          # Create a chamfer by creating a new face
-          # This is a simplified approach - in a real implementation,
-          # you would need to handle various edge cases
-          new_points = []
-          
-          # For each vertex of the edge
-          [edge.start, edge.end].each do |vertex|
-            # Get all edges connected to this vertex
-            connected_edges = vertex.edges - [edge]
-            
-            # For each connected edge
-            connected_edges.each do |connected_edge|
-              # Get the other vertex of the connected edge
-              other_vertex = (connected_edge.vertices - [vertex])[0]
-              
-              # Calculate a point along the connected edge
-              direction = other_vertex.position - vertex.position
-              new_point = vertex.position.offset(direction, distance)
-              
-              new_points << new_point
-            end
-          end
-          
-          # Create a new face using the new points
-          if new_points.length >= 3
-            result_group.entities.add_face(new_points)
-          end
+        target_group = to_solid_group(target_entity)
+        tool_group = to_solid_group(tool_entity)
+
+        if target_group.volume <= 0
+          raise "Target entity is not a solid (volume is zero)"
         end
-        
-        # Clean up the original entity if requested
-        if params["delete_original"]
-          entity.erase! if entity.valid?
+        if tool_group.volume <= 0
+          raise "Tool entity is not a solid (volume is zero)"
         end
-        
-        # Return the result
-        { 
-          success: true, 
-          id: result_group.entityID
-        }
-      rescue StandardError => e
-        log "Error in chamfer_edges: #{e.message}"
-        log e.backtrace.join("\n")
-        
-        # Clean up the result group if there was an error
-        result_group.erase! if result_group.valid?
-        
+
+        # Native solid operations consume both operand groups and return a
+        # new group with the result.
+        result_group = case operation_type
+        when "union"
+          target_group.union(tool_group)
+        when "difference"
+          target_group.subtract(tool_group)
+        when "intersection"
+          target_group.intersect(tool_group)
+        end
+        raise "#{operation_type} failed" unless result_group
+
+        if params["delete_originals"]
+          target_entity.erase! if target_entity.valid?
+          tool_entity.erase! if tool_entity.valid?
+        end
+
+        model.commit_operation
+        { success: true, id: result_group.entityID }
+      rescue Exception
+        model.abort_operation
         raise
       end
     end
-    
-    def fillet_edges(params)
-      log "Filleting edges with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get entity ID
-      entity_id = params["entity_id"].to_s.gsub('"', '')
-      log "Looking for entity with ID: #{entity_id}"
-      
-      entity = model.find_entity_by_id(entity_id.to_i)
-      unless entity
-        raise "Entity not found: #{entity_id}"
-      end
-      
-      # Ensure entity is a group or component instance
-      unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
-        raise "Fillet operation requires a group or component instance"
-      end
-      
-      # Get the radius parameter
-      radius = params["radius"] || 0.5
-      
-      # Get the number of segments for the fillet
-      segments = params["segments"] || 8
-      
-      # Get the entities collection
-      entities = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
-      
-      # Find all edges in the entity
-      edges = entities.grep(Sketchup::Edge)
-      
-      # If specific edges are provided, filter the edges
-      if params["edge_indices"] && params["edge_indices"].is_a?(Array)
-        edge_indices = params["edge_indices"]
-        edges = edges.select.with_index { |_, i| edge_indices.include?(i) }
-      end
-      
-      # Create a new group to hold the result
-      result_group = model.active_entities.add_group
-      
-      # Copy all entities from the original to the result
-      entities.each do |e|
-        e.copy(result_group.entities)
-      end
-      
-      # Get the edges in the result group
-      result_edges = result_group.entities.grep(Sketchup::Edge)
-      
-      # If specific edges were provided, filter the result edges
-      if params["edge_indices"] && params["edge_indices"].is_a?(Array)
-        edge_indices = params["edge_indices"]
-        result_edges = result_edges.select.with_index { |_, i| edge_indices.include?(i) }
-      end
-      
-      # Perform the fillet operation
-      begin
-        # For each edge, create a fillet
-        result_edges.each do |edge|
-          # Get the faces connected to this edge
-          faces = edge.faces
-          next if faces.length < 2
-          
-          # Get the start and end points of the edge
-          start_point = edge.start.position
-          end_point = edge.end.position
-          
-          # Calculate the midpoint of the edge
-          midpoint = Geom::Point3d.new(
-            (start_point.x + end_point.x) / 2.0,
-            (start_point.y + end_point.y) / 2.0,
-            (start_point.z + end_point.z) / 2.0
-          )
-          
-          # Calculate the edge vector
-          edge_vector = end_point - start_point
-          edge_length = edge_vector.length
-          
-          # Create points for the fillet curve
-          fillet_points = []
-          
-          # Create a series of points along a circular arc
-          (0..segments).each do |i|
-            angle = Math::PI * i / segments
-            
-            # Calculate the point on the arc
-            x = midpoint.x + radius * Math.cos(angle)
-            y = midpoint.y + radius * Math.sin(angle)
-            z = midpoint.z
-            
-            fillet_points << Geom::Point3d.new(x, y, z)
-          end
-          
-          # Create edges connecting the fillet points
-          (0...fillet_points.length - 1).each do |i|
-            result_group.entities.add_line(fillet_points[i], fillet_points[i+1])
-          end
-          
-          # Create a face from the fillet points
-          if fillet_points.length >= 3
-            result_group.entities.add_face(fillet_points)
-          end
-        end
-        
-        # Clean up the original entity if requested
-        if params["delete_original"]
-          entity.erase! if entity.valid?
-        end
-        
-        # Return the result
-        { 
-          success: true, 
-          id: result_group.entityID
-        }
-      rescue StandardError => e
-        log "Error in fillet_edges: #{e.message}"
-        log e.backtrace.join("\n")
-        
-        # Clean up the result group if there was an error
-        result_group.erase! if result_group.valid?
-        
-        raise
+
+    # --- Joint helpers -----------------------------------------------------
+    # Joints are built by positioning box/trapezoid prisms in world space and
+    # applying the native solid operations: mortises and slots subtract,
+    # tenons and fingers union. All dimensions are in inches after
+    # convert_joint_units! has scaled the caller's unit.
+
+    # Per face direction: [normal axis, normal sign, width axis, height axis].
+    FACE_FRAMES = {
+      east:  [0,  1, 1, 2], west:  [0, -1, 1, 2],
+      north: [1,  1, 0, 2], south: [1, -1, 0, 2],
+      top:   [2,  1, 0, 1], bottom: [2, -1, 0, 1]
+    }.freeze
+
+    def convert_joint_units!(params)
+      unit = (params["unit"] || "inch").to_s.downcase
+      factor = UNIT_TO_INCH[unit]
+      raise "Unknown unit: #{unit.inspect} (supported: inch, mm, cm, m)" unless factor
+      ["width", "height", "depth", "offset_x", "offset_y", "offset_z"].each do |k|
+        params[k] = params[k].to_f * factor if params[k]
       end
     end
-    
+
+    def find_board(id_value, label)
+      model = Sketchup.active_model
+      board = model.find_entity_by_id(id_value.to_s.gsub('"', '').to_i)
+      raise "#{label} not found (id #{id_value})" unless board
+      unless board.is_a?(Sketchup::Group) || board.is_a?(Sketchup::ComponentInstance)
+        raise "#{label} must be a group or component instance"
+      end
+      board
+    end
+
+    def joint_offsets(params)
+      [params["offset_x"].to_f, params["offset_y"].to_f, params["offset_z"].to_f]
+    end
+
+    # Joints are cut with classic SketchUp geometry (face split + pushpull)
+    # instead of the native solid operations: the solid ops proved
+    # unreliable for small joinery features, sometimes returning the
+    # intersection instead of the difference. This way boards keep their
+    # entity IDs, and it requires no Pro solid tools.
+
+    # Geometry container and world->local transform of a board. Component
+    # instances are edited through their definition; assume the definition
+    # is not shared between unrelated instances.
+    def board_context(board)
+      if board.is_a?(Sketchup::Group)
+        [board.entities, board.transformation.inverse]
+      else
+        [board.definition.entities, board.transformation.inverse]
+      end
+    end
+
+    # Four corners of a rectangle on the face plane of the bounds, world
+    # coordinates. ta0/tb0 are the lower corner on the width/height axes.
+    def face_rect_world(bounds, dir, ta0, len_ta, tb0, len_tb)
+      axis, sign, ta, tb = FACE_FRAMES[dir]
+      plane = sign > 0 ? bounds.max.to_a[axis] : bounds.min.to_a[axis]
+      [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]].map do |i, j|
+        p = [0.0, 0.0, 0.0]
+        p[axis] = plane
+        p[ta] = ta0 + i * len_ta
+        p[tb] = tb0 + j * len_tb
+        p
+      end
+    end
+
+    # Centered rectangle start on both tangential axes (width along the
+    # width axis, height along the height axis), shifted by world offsets.
+    def centered_face_rect(bounds, dir, width, height, offsets)
+      axis, sign, ta, tb = FACE_FRAMES[dir]
+      center = bounds.center.to_a
+      ta0 = center[ta] - width / 2.0 + offsets[ta]
+      tb0 = center[tb] - height / 2.0 + offsets[tb]
+      face_rect_world(bounds, dir, ta0, width, tb0, height)
+    end
+
+    # Draw rect_corners (world) on the board's face in the given direction
+    # and pushpull it by distance: inward cuts a slot, outward grows a
+    # tenon/finger. The board is modified in place; raises when the volume
+    # change does not match (face not on the board surface, non-box board).
+    def cut_or_grow(board, dir, rect_corners, distance, inward, expected_delta)
+      model = Sketchup.active_model
+      entities, inv = board_context(board)
+      local_pts = rect_corners.map { |p| Geom::Point3d.new(*p).transform(inv) }
+      before_bb = board.bounds
+      before_faces = entities.grep(Sketchup::Face).size
+
+      before = board.volume
+      face = entities.add_face(local_pts)
+      raise "Could not create a face on the board surface; is the board face aligned with its bounds?" unless face
+
+      # add_face on an existing surface splits it and may return either of
+      # the two resulting regions. If we got the surrounding region instead
+      # of the feature rectangle, find the small face at the rect center.
+      rect_area = local_pts[0].distance(local_pts[1]) * local_pts[1].distance(local_pts[2])
+      if (face.area - rect_area).abs > rect_area * 0.01
+        center_local = Geom::Point3d.new(
+          local_pts.map { |p| p.x }.sum / 4.0,
+          local_pts.map { |p| p.y }.sum / 4.0,
+          local_pts.map { |p| p.z }.sum / 4.0
+        )
+        small = entities.grep(Sketchup::Face).select do |f|
+          (f.area - rect_area).abs <= rect_area * 0.01
+        end
+        face = small.min_by { |f| (f.bounds.center - center_local).length }
+        raise "Feature rectangle not found on the board face" unless face
+      end
+
+      axis, sign, = FACE_FRAMES[dir]
+      n_world = Geom::Vector3d.new(0, 0, 0)
+      n_world[axis] = sign
+      n_local = n_world.transform(inv)
+      face.reverse! if face.normal % n_local < 0
+      face.pushpull(inward ? -distance : distance)
+
+      after = board.volume
+      if after >= 0
+        actual = (after - before).abs
+        if (actual - expected_delta).abs > expected_delta * 0.01 + 1e-6
+          raise "Joint cut did not land on the board face (volume changed by #{actual.round(4)} instead of #{expected_delta.round(4)}); the board may not be axis-aligned or the feature overhangs the face"
+        end
+      else
+        # SketchUp reports a negative sentinel volume for solids it cannot
+        # evaluate right after an edit; fall back to geometric checks.
+        after_bb = board.bounds
+        after_faces = entities.grep(Sketchup::Face).size
+        axis, sign, = FACE_FRAMES[dir]
+        ok = after_faces > before_faces
+        if inward
+          grew = (after_bb.max.to_a[axis] - before_bb.max.to_a[axis]).abs < 1e-4 &&
+                 (after_bb.min.to_a[axis] - before_bb.min.to_a[axis]).abs < 1e-4
+        else
+          face_coord = sign > 0 ? after_bb.max.to_a[axis] - before_bb.max.to_a[axis]
+                                : before_bb.min.to_a[axis] - after_bb.min.to_a[axis]
+          grew = face_coord >= distance * 0.99
+        end
+        raise "Joint cut did not land on the board face (geometric check failed); the board may not be axis-aligned or the feature overhangs the face" unless ok && grew
+      end
+      face
+    end
+
+    # After a pushpull, find the cap face of the slot/tail (parallel to the
+    # opening, at exactly `depth` from the opening plane) and slide it
+    # sideways along the width axis, turning the straight feature into a
+    # tapered dovetail. Moves the face's edges so neighbouring faces stretch.
+    def stretch_end_face(board, dir, rect_corners, depth, taper)
+      entities, inv = board_context(board)
+      axis, sign, ta, tb = FACE_FRAMES[dir]
+      n_world = Geom::Vector3d.new(0, 0, 0)
+      n_world[axis] = sign
+
+      cx = rect_corners.map { |c| c[0] }.sum / 4.0
+      cy = rect_corners.map { |c| c[1] }.sum / 4.0
+      cz = rect_corners.map { |c| c[2] }.sum / 4.0
+      opening_local = Geom::Point3d.new(cx, cy, cz).transform(inv)
+      # Distance from the opening plane along the normal axis, in local units.
+      candidates = entities.grep(Sketchup::Face).select do |f|
+        (f.normal % n_world).abs > 0.999
+      end
+      end_face = candidates.min_by do |f|
+        c = f.bounds.center
+        ((c - opening_local).length - depth).abs
+      end
+      raise "Could not find the slot end face to taper" unless end_face
+
+      move = Geom::Transformation.translation(Geom::Vector3d.new(0, 0, 0).tap { |v| v[ta] = taper })
+      entities.transform_entities(move, end_face.edges.uniq)
+    end
+
+    # --- Joints ------------------------------------------------------------
+
     def create_mortise_tenon(params)
       log "Creating mortise and tenon joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the mortise and tenon board IDs
-      mortise_id = params["mortise_id"].to_s.gsub('"', '')
-      tenon_id = params["tenon_id"].to_s.gsub('"', '')
-      
-      log "Looking for mortise board with ID: #{mortise_id}"
-      mortise_board = model.find_entity_by_id(mortise_id.to_i)
-      
-      log "Looking for tenon board with ID: #{tenon_id}"
-      tenon_board = model.find_entity_by_id(tenon_id.to_i)
-      
-      unless mortise_board && tenon_board
-        missing = []
-        missing << "mortise board" unless mortise_board
-        missing << "tenon board" unless tenon_board
-        raise "Entity not found: #{missing.join(', ')}"
-      end
-      
-      # Ensure both entities are groups or component instances
-      unless (mortise_board.is_a?(Sketchup::Group) || mortise_board.is_a?(Sketchup::ComponentInstance)) &&
-             (tenon_board.is_a?(Sketchup::Group) || tenon_board.is_a?(Sketchup::ComponentInstance))
-        raise "Mortise and tenon operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
+      convert_joint_units!(params)
+      mortise_board = find_board(params["mortise_id"], "Mortise board")
+      tenon_board = find_board(params["tenon_id"], "Tenon board")
+
       width = params["width"] || 1.0
       height = params["height"] || 1.0
       depth = params["depth"] || 1.0
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Get the bounds of both boards
-      mortise_bounds = mortise_board.bounds
-      tenon_bounds = tenon_board.bounds
-      
-      # Determine the face to place the joint on based on the relative positions of the boards
-      mortise_center = mortise_bounds.center
-      tenon_center = tenon_bounds.center
-      
-      # Calculate the direction vector from mortise to tenon
-      direction_vector = tenon_center - mortise_center
-      
-      # Determine which face of the mortise board is closest to the tenon board
-      mortise_face_direction = determine_closest_face(direction_vector)
-      
-      # Create the mortise (hole) in the mortise board
-      mortise_result = create_mortise(
-        mortise_board, 
-        width, 
-        height, 
-        depth, 
-        mortise_face_direction,
-        mortise_bounds,
-        offset_x, 
-        offset_y, 
-        offset_z
-      )
-      
-      # Determine which face of the tenon board is closest to the mortise board
-      tenon_face_direction = determine_closest_face(direction_vector.reverse)
-      
-      # Create the tenon (projection) on the tenon board
-      tenon_result = create_tenon(
-        tenon_board, 
-        width, 
-        height, 
-        depth, 
-        tenon_face_direction,
-        tenon_bounds,
-        offset_x, 
-        offset_y, 
-        offset_z
-      )
-      
-      # Return the result
-      { 
-        success: true, 
-        mortise_id: mortise_result[:id],
-        tenon_id: tenon_result[:id]
-      }
-    end
-    
-    def determine_closest_face(direction_vector)
-      # Normalize the direction vector
-      direction_vector.normalize!
-      
-      # Determine which axis has the largest component
-      x_abs = direction_vector.x.abs
-      y_abs = direction_vector.y.abs
-      z_abs = direction_vector.z.abs
-      
-      if x_abs >= y_abs && x_abs >= z_abs
-        # X-axis is dominant
-        return direction_vector.x > 0 ? :east : :west
-      elsif y_abs >= x_abs && y_abs >= z_abs
-        # Y-axis is dominant
-        return direction_vector.y > 0 ? :north : :south
-      else
-        # Z-axis is dominant
-        return direction_vector.z > 0 ? :top : :bottom
-      end
-    end
-    
-    def create_mortise(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
+      offsets = joint_offsets(params)
+
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Calculate the position of the mortise based on the face direction
-      mortise_position = calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      
-      log "Creating mortise at position: #{mortise_position.inspect} with dimensions: #{[width, height, depth].inspect}"
-      
-      # Create a box for the mortise
-      mortise_group = entities.add_group
-      
-      # Create the mortise box with the correct orientation
-      case face_direction
-      when :east, :west
-        # Mortise on east or west face (YZ plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + width, mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        mortise_face.pushpull(face_direction == :east ? -depth : depth)
-      when :north, :south
-        # Mortise on north or south face (XZ plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2] + height],
-          [mortise_position[0], mortise_position[1], mortise_position[2] + height]
-        )
-        mortise_face.pushpull(face_direction == :north ? -depth : depth)
-      when :top, :bottom
-        # Mortise on top or bottom face (XY plane)
-        mortise_face = mortise_group.entities.add_face(
-          [mortise_position[0], mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1], mortise_position[2]],
-          [mortise_position[0] + width, mortise_position[1] + height, mortise_position[2]],
-          [mortise_position[0], mortise_position[1] + height, mortise_position[2]]
-        )
-        mortise_face.pushpull(face_direction == :top ? -depth : depth)
-      end
-      
-      # Subtract the mortise from the board
-      entities.subtract(mortise_group.entities)
-      
-      # Clean up the temporary group
-      mortise_group.erase!
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
-    def create_tenon(board, width, height, depth, face_direction, bounds, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Calculate the position of the tenon based on the face direction
-      tenon_position = calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      
-      log "Creating tenon at position: #{tenon_position.inspect} with dimensions: #{[width, height, depth].inspect}"
-      
-      # Create a box for the tenon
-      tenon_group = model.active_entities.add_group
-      
-      # Create the tenon box with the correct orientation
-      case face_direction
-      when :east, :west
-        # Tenon on east or west face (YZ plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + width, tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + width, tenon_position[2] + height],
-          [tenon_position[0], tenon_position[1], tenon_position[2] + height]
-        )
-        tenon_face.pushpull(face_direction == :east ? depth : -depth)
-      when :north, :south
-        # Tenon on north or south face (XZ plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2] + height],
-          [tenon_position[0], tenon_position[1], tenon_position[2] + height]
-        )
-        tenon_face.pushpull(face_direction == :north ? depth : -depth)
-      when :top, :bottom
-        # Tenon on top or bottom face (XY plane)
-        tenon_face = tenon_group.entities.add_face(
-          [tenon_position[0], tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1], tenon_position[2]],
-          [tenon_position[0] + width, tenon_position[1] + height, tenon_position[2]],
-          [tenon_position[0], tenon_position[1] + height, tenon_position[2]]
-        )
-        tenon_face.pushpull(face_direction == :top ? depth : -depth)
-      end
-      
-      # Get the transformation of the board
-      board_transform = board.transformation
-      
-      # Apply the inverse transformation to the tenon group
-      tenon_group.transform!(board_transform.inverse)
-      
-      # Union the tenon with the board
-      board_entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      board_entities.add_instance(tenon_group.entities.parent, Geom::Transformation.new)
-      
-      # Clean up the temporary group
-      tenon_group.erase!
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
-    def calculate_position_on_face(face_direction, bounds, width, height, depth, offset_x, offset_y, offset_z)
-      # Calculate the position on the specified face with offsets
-      case face_direction
-      when :east
-        # Position on the east face (max X)
-        [
-          bounds.max.x,
-          bounds.center.y - width/2 + offset_y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :west
-        # Position on the west face (min X)
-        [
-          bounds.min.x,
-          bounds.center.y - width/2 + offset_y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :north
-        # Position on the north face (max Y)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.max.y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :south
-        # Position on the south face (min Y)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.min.y,
-          bounds.center.z - height/2 + offset_z
-        ]
-      when :top
-        # Position on the top face (max Z)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.center.y - height/2 + offset_y,
-          bounds.max.z
-        ]
-      when :bottom
-        # Position on the bottom face (min Z)
-        [
-          bounds.center.x - width/2 + offset_x,
-          bounds.center.y - height/2 + offset_y,
-          bounds.min.z
-        ]
+      model.start_operation("MCP mortise and tenon", true)
+      begin
+        direction = mortise_board.bounds.center.vector_to(tenon_board.bounds.center)
+        mortise_dir = determine_closest_face(direction)
+        tenon_dir = determine_closest_face(direction.reverse)
+
+        rect = centered_face_rect(mortise_board.bounds, mortise_dir, width, height, offsets)
+        cut_or_grow(mortise_board, mortise_dir, rect, depth, true, width * height * depth)
+
+        rect = centered_face_rect(tenon_board.bounds, tenon_dir, width, height, offsets)
+        cut_or_grow(tenon_board, tenon_dir, rect, depth, false, width * height * depth)
+
+        model.commit_operation
+        { success: true, mortise_id: mortise_board.entityID, tenon_id: tenon_board.entityID }
+      rescue Exception
+        model.abort_operation
+        raise
       end
     end
-    
-    def create_dovetail(params)
-      log "Creating dovetail joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the tail and pin board IDs
-      tail_id = params["tail_id"].to_s.gsub('"', '')
-      pin_id = params["pin_id"].to_s.gsub('"', '')
-      
-      log "Looking for tail board with ID: #{tail_id}"
-      tail_board = model.find_entity_by_id(tail_id.to_i)
-      
-      log "Looking for pin board with ID: #{pin_id}"
-      pin_board = model.find_entity_by_id(pin_id.to_i)
-      
-      unless tail_board && pin_board
-        missing = []
-        missing << "tail board" unless tail_board
-        missing << "pin board" unless pin_board
-        raise "Entity not found: #{missing.join(', ')}"
-      end
-      
-      # Ensure both entities are groups or component instances
-      unless (tail_board.is_a?(Sketchup::Group) || tail_board.is_a?(Sketchup::ComponentInstance)) &&
-             (pin_board.is_a?(Sketchup::Group) || pin_board.is_a?(Sketchup::ComponentInstance))
-        raise "Dovetail operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
-      width = params["width"] || 1.0
-      height = params["height"] || 2.0
-      depth = params["depth"] || 1.0
-      angle = params["angle"] || 15.0  # Dovetail angle in degrees
-      num_tails = params["num_tails"] || 3
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Create the tails on the tail board
-      tail_result = create_tails(tail_board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      
-      # Create the pins on the pin board
-      pin_result = create_pins(pin_board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      
-      # Return the result
-      { 
-        success: true, 
-        tail_id: tail_result[:id],
-        pin_id: pin_result[:id]
-      }
-    end
-    
-    def create_tails(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the dovetail joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each tail and space
-      total_width = width
-      tail_width = total_width / (2 * num_tails - 1)
-      
-      # Create a group for the tails
-      tails_group = entities.add_group
-      
-      # Create each tail
-      num_tails.times do |i|
-        # Calculate the position of this tail
-        tail_center_x = center_x - width/2 + tail_width * (2 * i)
-        
-        # Calculate the dovetail shape
-        angle_rad = angle * Math::PI / 180.0
-        tail_top_width = tail_width
-        tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
-        
-        # Create the tail shape
-        tail_points = [
-          [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
-          [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
-        # Create the tail face
-        tail_face = tails_group.entities.add_face(tail_points)
-        
-        # Extrude the tail
-        tail_face.pushpull(height)
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
-    def create_pins(board, width, height, depth, angle, num_tails, offset_x, offset_y, offset_z)
-      model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the dovetail joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each tail and space
-      total_width = width
-      tail_width = total_width / (2 * num_tails - 1)
-      
-      # Create a group for the pins
-      pins_group = entities.add_group
-      
-      # Create a box for the entire pin area
-      pin_area_face = pins_group.entities.add_face(
-        [center_x - width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y + height/2, center_z],
-        [center_x - width/2, center_y + height/2, center_z]
-      )
-      
-      # Extrude the pin area
-      pin_area_face.pushpull(depth)
-      
-      # Create each tail cutout
-      num_tails.times do |i|
-        # Calculate the position of this tail
-        tail_center_x = center_x - width/2 + tail_width * (2 * i)
-        
-        # Calculate the dovetail shape
-        angle_rad = angle * Math::PI / 180.0
-        tail_top_width = tail_width
-        tail_bottom_width = tail_width + 2 * depth * Math.tan(angle_rad)
-        
-        # Create a group for the tail cutout
-        tail_cutout_group = entities.add_group
-        
-        # Create the tail cutout shape
-        tail_points = [
-          [tail_center_x - tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_top_width/2, center_y - height/2, center_z],
-          [tail_center_x + tail_bottom_width/2, center_y - height/2, center_z - depth],
-          [tail_center_x - tail_bottom_width/2, center_y - height/2, center_z - depth]
-        ]
-        
-        # Create the tail cutout face
-        tail_face = tail_cutout_group.entities.add_face(tail_points)
-        
-        # Extrude the tail cutout
-        tail_face.pushpull(height)
-        
-        # Subtract the tail cutout from the pin area
-        pins_group.entities.subtract(tail_cutout_group.entities)
-        
-        # Clean up the temporary group
-        tail_cutout_group.erase!
-      end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
-    end
-    
+
     def create_finger_joint(params)
       log "Creating finger joint with params: #{params.inspect}"
-      model = Sketchup.active_model
-      
-      # Get the two board IDs
-      board1_id = params["board1_id"].to_s.gsub('"', '')
-      board2_id = params["board2_id"].to_s.gsub('"', '')
-      
-      log "Looking for board 1 with ID: #{board1_id}"
-      board1 = model.find_entity_by_id(board1_id.to_i)
-      
-      log "Looking for board 2 with ID: #{board2_id}"
-      board2 = model.find_entity_by_id(board2_id.to_i)
-      
-      unless board1 && board2
-        missing = []
-        missing << "board 1" unless board1
-        missing << "board 2" unless board2
-        raise "Entity not found: #{missing.join(', ')}"
-      end
-      
-      # Ensure both entities are groups or component instances
-      unless (board1.is_a?(Sketchup::Group) || board1.is_a?(Sketchup::ComponentInstance)) &&
-             (board2.is_a?(Sketchup::Group) || board2.is_a?(Sketchup::ComponentInstance))
-        raise "Finger joint operation requires groups or component instances"
-      end
-      
-      # Get joint parameters
+      convert_joint_units!(params)
+      board1 = find_board(params["board1_id"], "Board 1")
+      board2 = find_board(params["board2_id"], "Board 2")
+
       width = params["width"] || 1.0
-      height = params["height"] || 2.0
+      height = params["height"] || 1.0
       depth = params["depth"] || 1.0
-      num_fingers = params["num_fingers"] || 5
-      offset_x = params["offset_x"] || 0.0
-      offset_y = params["offset_y"] || 0.0
-      offset_z = params["offset_z"] || 0.0
-      
-      # Create the fingers on board 1
-      board1_result = create_board1_fingers(board1, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
-      # Create the matching slots on board 2
-      board2_result = create_board2_slots(board2, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
-      
-      # Return the result
-      { 
-        success: true, 
-        board1_id: board1_result[:id],
-        board2_id: board2_result[:id]
-      }
-    end
-    
-    def create_board1_fingers(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
+      num_fingers = [(params["num_fingers"] || 5).to_i, 1].max
+      offsets = joint_offsets(params)
+
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the fingers
-      fingers_group = entities.add_group
-      
-      # Create a base rectangle for the joint area
-      base_face = fingers_group.entities.add_face(
-        [center_x - width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y - height/2, center_z],
-        [center_x + width/2, center_y + height/2, center_z],
-        [center_x - width/2, center_y + height/2, center_z]
-      )
-      
-      # Create cutouts for the spaces between fingers
-      (num_fingers / 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i + 1)
-        
-        # Create a group for the cutout
-        cutout_group = entities.add_group
-        
-        # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        cutout_face.pushpull(depth)
-        
-        # Subtract the cutout from the fingers
-        fingers_group.entities.subtract(cutout_group.entities)
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+      model.start_operation("MCP finger joint", true)
+      begin
+        direction = board1.bounds.center.vector_to(board2.bounds.center)
+        dir1 = determine_closest_face(direction)
+        dir2 = determine_closest_face(direction.reverse)
+        finger_width = width / num_fingers
+
+        # board1 grows fingers on the near face; board2 gets matching slots
+        # on its near face at the same world positions, so the boards
+        # interlock when pushed together.
+        axis1, sign1, ta1, tb1 = FACE_FRAMES[dir1]
+        axis2, sign2, ta2, tb2 = FACE_FRAMES[dir2]
+        center1 = board1.bounds.center.to_a
+        center2 = board2.bounds.center.to_a
+        start1 = center1[ta1] - width / 2.0
+        start2 = center2[ta2] - width / 2.0
+
+        (0...num_fingers).each do |i|
+          rect = face_rect_world(board1.bounds, dir1,
+            start1 + finger_width * i + offsets[ta1], finger_width,
+            center1[tb1] - height / 2.0 + offsets[tb1], height)
+          cut_or_grow(board1, dir1, rect, depth, false, finger_width * height * depth)
+
+          rect = face_rect_world(board2.bounds, dir2,
+            start2 + finger_width * i + offsets[ta2], finger_width,
+            center2[tb2] - height / 2.0 + offsets[tb2], height)
+          cut_or_grow(board2, dir2, rect, depth, true, finger_width * height * depth)
+        end
+
+        model.commit_operation
+        { success: true, board1_id: board1.entityID, board2_id: board2.entityID }
+      rescue Exception
+        model.abort_operation
+        raise
       end
-      
-      # Extrude the fingers
-      base_face.pushpull(depth)
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
-    
-    def create_board2_slots(board, width, height, depth, num_fingers, offset_x, offset_y, offset_z)
+
+    def create_dovetail(params)
+      log "Creating dovetail joint with params: #{params.inspect}"
+      convert_joint_units!(params)
+      tail_board = find_board(params["tail_id"], "Tail board")
+      pin_board = find_board(params["pin_id"], "Pin board")
+
+      width = params["width"] || 1.0
+      height = params["height"] || 1.0
+      depth = params["depth"] || 1.0
+      angle = params["angle"] || 15.0
+      num_tails = [(params["num_tails"] || 3).to_i, 1].max
+      offsets = joint_offsets(params)
+
       model = Sketchup.active_model
-      
-      # Get the board's entities
-      entities = board.is_a?(Sketchup::Group) ? board.entities : board.definition.entities
-      
-      # Get the board's bounds
-      bounds = board.bounds
-      
-      # Calculate the position of the joint
-      center_x = bounds.center.x + offset_x
-      center_y = bounds.center.y + offset_y
-      center_z = bounds.center.z + offset_z
-      
-      # Calculate the width of each finger
-      finger_width = width / num_fingers
-      
-      # Create a group for the slots
-      slots_group = entities.add_group
-      
-      # Create cutouts for the fingers from board 1
-      (num_fingers / 2 + num_fingers % 2).times do |i|
-        # Calculate the position of this cutout
-        cutout_center_x = center_x - width/2 + finger_width * (2 * i)
-        
-        # Create a group for the cutout
-        cutout_group = entities.add_group
-        
-        # Create the cutout shape
-        cutout_face = cutout_group.entities.add_face(
-          [cutout_center_x - finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y - height/2, center_z],
-          [cutout_center_x + finger_width/2, center_y + height/2, center_z],
-          [cutout_center_x - finger_width/2, center_y + height/2, center_z]
-        )
-        
-        # Extrude the cutout
-        cutout_face.pushpull(depth)
-        
-        # Subtract the cutout from the board
-        entities.subtract(cutout_group.entities)
-        
-        # Clean up the temporary group
-        cutout_group.erase!
+      model.start_operation("MCP dovetail", true)
+      begin
+        direction = tail_board.bounds.center.vector_to(pin_board.bounds.center)
+        tail_dir = determine_closest_face(direction)
+        pin_dir = determine_closest_face(direction.reverse)
+        tail_frame = FACE_FRAMES[tail_dir]
+        pin_frame = FACE_FRAMES[pin_dir]
+
+        # Tails occupy the even slots of a (2*num_tails - 1) division.
+        slot_width = width / (2 * num_tails - 1)
+        taper = depth * Math.tan(angle * Math::PI / 180.0)
+
+        tail_center = tail_board.bounds.center.to_a
+        pin_center = pin_board.bounds.center.to_a
+        tail_start = tail_center[tail_frame[2]] - width / 2.0
+        pin_start = pin_center[pin_frame[2]] - width / 2.0
+
+        num_tails.times do |i|
+          # Tail: straight protrusion, then the free end is stretched wider.
+          rect = face_rect_world(tail_board.bounds, tail_dir,
+            tail_start + slot_width * (2 * i) + offsets[tail_frame[2]], slot_width,
+            tail_center[tail_frame[3]] - height / 2.0 + offsets[tail_frame[3]], height)
+          face = cut_or_grow(tail_board, tail_dir, rect, depth, false, slot_width * height * depth)
+          stretch_end_face(tail_board, tail_dir, rect, depth, taper)
+
+          # Socket: straight slot into the pin board, inner end stretched
+          # wider so it matches the tail.
+          rect = face_rect_world(pin_board.bounds, pin_dir,
+            pin_start + slot_width * (2 * i) + offsets[pin_frame[2]], slot_width,
+            pin_center[pin_frame[3]] - height / 2.0 + offsets[pin_frame[3]], height)
+          cut_or_grow(pin_board, pin_dir, rect, depth, true, slot_width * height * depth)
+          stretch_end_face(pin_board, pin_dir, rect, depth, taper)
+        end
+
+        model.commit_operation
+        { success: true, tail_id: tail_board.entityID, pin_id: pin_board.entityID }
+      rescue Exception
+        model.abort_operation
+        raise
       end
-      
-      # Return the result
-      { 
-        success: true, 
-        id: board.entityID
-      }
     end
-    
+
+    def determine_closest_face(direction_vector)
+      v = direction_vector.normalize
+      x_abs = v.x.abs
+      y_abs = v.y.abs
+      z_abs = v.z.abs
+      if x_abs >= y_abs && x_abs >= z_abs
+        v.x > 0 ? :east : :west
+      elsif y_abs >= x_abs && y_abs >= z_abs
+        v.y > 0 ? :north : :south
+      else
+        v.z > 0 ? :top : :bottom
+      end
+    end
+
     def eval_ruby(params)
       log "Evaluating Ruby code with length: #{params['code'].length}"
-      
+
+      model = Sketchup.active_model
+      # Wrap mutations in an undoable operation so a failing script doesn't
+      # leave the model half-modified.
+      op_open = false
+      if model
+        model.start_operation("MCP eval_ruby", true)
+        op_open = true
+      end
+
       begin
-        # Create a safe binding for evaluation
-        binding = TOPLEVEL_BINDING.dup
-        
-        # Evaluate the Ruby code
-        log "Starting code evaluation..."
-        result = eval(params["code"], binding)
+        result = eval(params["code"], TOPLEVEL_BINDING.dup)
         log "Code evaluation completed with result: #{result.inspect}"
-        
-        # Return success with the result as a string
-        { 
+        model.commit_operation if op_open
+        {
           success: true,
           result: result.to_s
         }
-      rescue StandardError => e
-        log "Error in eval_ruby: #{e.message}"
-        log e.backtrace.join("\n")
-        raise "Ruby evaluation error: #{e.message}"
+      rescue Exception => e
+        # Rescue Exception, not just StandardError: SyntaxError (a ScriptError)
+        # and friends escape a plain StandardError rescue and used to kill the
+        # request without any response ever being sent back to the client.
+        model.abort_operation if op_open
+        log "Error in eval_ruby: #{e.class}: #{e.message}"
+        log e.backtrace.join("\n") if e.backtrace
+        raise "Ruby evaluation error: #{e.class}: #{e.message}"
       end
     end
   end
