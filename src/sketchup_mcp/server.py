@@ -16,28 +16,40 @@ logger = logging.getLogger("SketchupMCPServer")
 __version__ = "0.1.17"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
 
+class SketchupRubyError(Exception):
+    """Sketchup handled the request and returned a JSON-RPC error.
+
+    Distinct from a transport failure: the socket is still good, so it is
+    not torn down on the way out.
+    """
+
+
 @dataclass
 class SketchupConnection:
     host: str
     port: int
     sock: socket.socket = None
-    
+    # Bytes read off the socket that are not yet a complete JSON message.
+    # Belongs to this socket and only this socket, so it is cleared whenever
+    # the socket is.
+    buffer: bytes = b""
+
     def connect(self) -> bool:
-        """Connect to the Sketchup extension socket server"""
+        """Connect to the Sketchup extension socket server
+
+        An already-open socket is reused as-is. There is no liveness probe:
+        a probe that writes cannot tell a live peer from one that has sent
+        FIN - the local send succeeds either way - so it only reports false
+        health. If the peer really has gone away, the send or the read in
+        send_command fails and that is where we reconnect.
+        """
         if self.sock:
-            try:
-                # Test if connection is still alive
-                self.sock.settimeout(0.1)
-                self.sock.send(b'')
-                return True
-            except (socket.error, BrokenPipeError, ConnectionResetError):
-                # Connection is dead, close it and reconnect
-                logger.info("Connection test failed, reconnecting...")
-                self.disconnect()
-            
+            return True
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
+            self.buffer = b""
             logger.info(f"Connected to Sketchup at {self.host}:{self.port}")
             return True
         except Exception as e:
@@ -54,52 +66,81 @@ class SketchupConnection:
                 logger.error(f"Error disconnecting from Sketchup: {str(e)}")
             finally:
                 self.sock = None
+                self.buffer = b""
 
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        sock.settimeout(15.0)
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        if not chunks:
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
+    def receive_response(self, timeout=15.0):
+        """Read until one complete JSON object is available and return it
+
+        The extension writes one object per response and keeps the socket
+        open, so anything after the object we want belongs to a later read.
+        Scan the buffer for a single complete object, consume exactly that,
+        and leave the rest alone - re-parsing the whole buffer after every
+        chunk would both throw away the remainder and mis-handle a payload
+        that arrives in pieces.
+        """
+        self.sock.settimeout(timeout)
+
+        while True:
+            parsed, consumed = self._take_json_prefix(self.buffer)
+            if consumed:
+                self.buffer = self.buffer[consumed:]
+                if parsed is None:
+                    raise Exception("Malformed JSON response from Sketchup")
+                return parsed
+
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                if not self.buffer:
+                    raise ConnectionError("Connection closed before receiving any data")
+                raise ConnectionError("Connection closed mid-response")
+            self.buffer += chunk
+
+    @staticmethod
+    def _take_json_prefix(buf: bytes):
+        """Pull one complete JSON object off the front of *buf*
+
+        Returns (object, bytes_consumed). (None, 0) means the buffer holds
+        only part of a message; (None, n) means the first n bytes are a
+        balanced but unparseable object, which the caller drops rather than
+        wedging the stream on it.
+        """
+        i = 0
+        while i < len(buf) and buf[i : i + 1].isspace():
+            i += 1
+        if i == len(buf):
+            return None, 0
+
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < len(buf):
+            c = buf[j : j + 1]
+            if in_string:
+                if escape:
+                    escape = False
+                elif c == b"\\":
+                    escape = True
+                elif c == b'"':
+                    in_string = False
+            elif c == b'"':
+                in_string = True
+            elif c == b"{":
+                depth += 1
+            elif c == b"}":
+                depth -= 1
+                if depth <= 0:
+                    # Take trailing whitespace too, so a quiet connection
+                    # sits on an empty buffer.
+                    end = j + 1
+                    while end < len(buf) and buf[end : end + 1].isspace():
+                        end += 1
                     try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        continue
-                except socket.timeout:
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+                        return json.loads(buf[i : j + 1].decode("utf-8")), end
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return None, end
+            j += 1
+        return None, 0
 
     def send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
         """Send a JSON-RPC request to Sketchup and return the response"""
@@ -151,10 +192,7 @@ class SketchupConnection:
                 
                 self.sock.settimeout(15.0)
                 
-                response_data = self.receive_full_response(self.sock)
-                logger.info(f"Received {len(response_data)} bytes of data")
-                
-                response = json.loads(response_data.decode('utf-8'))
+                response = self.receive_response(timeout=15.0)
                 logger.info(f"Response parsed: {response}")
 
                 if not isinstance(response, dict):
@@ -162,7 +200,9 @@ class SketchupConnection:
 
                 if "error" in response:
                     logger.error(f"Sketchup error: {response['error']}")
-                    raise Exception(response["error"].get("message", "Unknown error from Sketchup"))
+                    raise SketchupRubyError(
+                        response["error"].get("message", "Unknown error from Sketchup")
+                    )
 
                 return response.get("result", {})
                 
@@ -178,18 +218,21 @@ class SketchupConnection:
                         break
                 else:
                     logger.error(f"Max retries reached, giving up")
-                    self.sock = None
+                    self.disconnect()
                     raise Exception(f"Connection to Sketchup lost after {max_retries+1} attempts: {str(e)}")
             
+            except SketchupRubyError:
+                # Sketchup answered, it just answered with an error. The
+                # connection is fine; keep it.
+                raise
+
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON response from Sketchup: {str(e)}")
-                if 'response_data' in locals() and response_data:
-                    logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
                 raise Exception(f"Invalid response from Sketchup: {str(e)}")
-            
+
             except Exception as e:
                 logger.error(f"Error communicating with Sketchup: {str(e)}")
-                self.sock = None
+                self.disconnect()
                 raise Exception(f"Communication error with Sketchup: {str(e)}")
 
 # Global connection management
@@ -199,33 +242,26 @@ def get_sketchup_connection():
     """Get or create a persistent Sketchup connection"""
     global _sketchup_connection
     
-    if _sketchup_connection is not None:
-        try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
-    
+    # No health check here. The ping this used to send was never read back,
+    # so its reply would sit in the stream ahead of the next real response -
+    # and a send on a socket whose peer has already gone succeeds locally
+    # anyway, so it never detected the thing it was meant to detect. A dead
+    # socket now surfaces as a failed send or read in send_command, which
+    # disconnects; the next call through here reconnects.
     if _sketchup_connection is None:
         _sketchup_connection = SketchupConnection(host="localhost", port=9876)
-        if not _sketchup_connection.connect():
-            logger.error("Failed to connect to Sketchup")
-            _sketchup_connection = None
-            raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
-        logger.info("Created new persistent connection to Sketchup")
-    
+
+    # connect() is a no-op when the socket is already open, and reconnects
+    # when a previous call found it dead and dropped it.
+    if not _sketchup_connection.connect():
+        logger.error("Failed to connect to Sketchup")
+        _sketchup_connection = None
+        raise Exception(
+            "Could not connect to Sketchup at localhost:9876. "
+            "Make sure the Sketchup extension is running (it starts with "
+            "Sketchup; Extensions > MCP Server > Start Server to retry)."
+        )
+
     return _sketchup_connection
 
 @asynccontextmanager

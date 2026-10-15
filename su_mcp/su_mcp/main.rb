@@ -13,6 +13,10 @@ module SU_MCP
       @server = nil
       @running = false
       @timer_id = nil
+      @in_tick = false
+      # Accepted clients, kept across timer ticks: { :sock, :buffer, :id }
+      @clients = []
+      @next_client_id = 1
       
       # Try multiple ways to show console
       begin
@@ -35,6 +39,11 @@ module SU_MCP
       STDOUT.flush
     end
 
+    # Bytes per non-blocking read, and the point at which we give up on a
+    # client rather than buffer an unbounded request for it.
+    READ_CHUNK        = 16384
+    MAX_REQUEST_BYTES = 8 * 1024 * 1024
+
     def start
       return if @running
       
@@ -46,80 +55,7 @@ module SU_MCP
         
         @running = true
         
-        @timer_id = UI.start_timer(0.1, true) {
-          begin
-            if @running
-              # Check for connection
-              ready = IO.select([@server], nil, nil, 0)
-              if ready
-                log "Connection waiting..."
-                client = @server.accept_nonblock
-                log "Client accepted"
-                
-                data = client.gets
-                log "Raw data: #{data.inspect}"
-                
-                if data
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
-                  end
-                end
-                
-                client.close
-                log "Client closed"
-              end
-            end
-          rescue IO::WaitReadable
-            # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
-          end
-        }
+        @timer_id = UI.start_timer(0.1, true) { tick }
         
         log "Server started and listening"
         
@@ -127,6 +63,187 @@ module SU_MCP
         log "Error: #{e.message}"
         log e.backtrace.join("\n")
         stop
+      end
+    end
+
+    # One pass of the timer: take any new connections, then service the ones
+    # we already hold.
+    #
+    # Clients live across ticks. The MCP server on the other end keeps a
+    # single socket open for the whole session and sends many requests down
+    # it, so closing after one request - which is what this used to do -
+    # left it writing into a socket the peer had already finished with. The
+    # write succeeds locally and the next read returns EOF, which is why
+    # every second eval_ruby failed with "Connection closed before receiving
+    # any data".
+    def tick
+      return unless @running
+      # A blocking approval dialog pumps the event loop, so the timer can
+      # fire again while we are inside a request. Re-entering here would
+      # read from a client's socket underneath the call that is mid-flight
+      # and scramble its buffer.
+      return if @in_tick
+      @in_tick = true
+      begin
+        accept_new_connections
+        service_clients
+      ensure
+        @in_tick = false
+      end
+    rescue StandardError => e
+      log "Timer error: #{e.message}"
+      log e.backtrace.join("\n")
+    end
+
+    def accept_new_connections
+      loop do
+        break unless IO.select([@server], nil, nil, 0)
+        begin
+          sock = @server.accept_nonblock
+        rescue IO::WaitReadable
+          break
+        end
+        @clients << { :sock => sock, :buffer => String.new, :id => @next_client_id }
+        log "Client ##{@next_client_id} connected"
+        @next_client_id += 1
+      end
+    end
+
+    def service_clients
+      @clients.reject! do |client|
+        begin
+          drain_client(client)
+          false
+        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
+          log "Client ##{client[:id]} disconnected"
+          client[:sock].close rescue nil
+          true
+        rescue StandardError => e
+          log "Client ##{client[:id]} error: #{e.message}"
+          client[:sock].close rescue nil
+          true
+        end
+      end
+    end
+
+    # Read whatever bytes are waiting, then dispatch every complete JSON
+    # object the buffer now holds. Reading by object rather than by line is
+    # also what stops a request being truncated at the first newline inside
+    # a string - eval_ruby snippets are full of them.
+    def drain_client(client)
+      sock = client[:sock]
+
+      loop do
+        begin
+          client[:buffer] << sock.read_nonblock(READ_CHUNK)
+        rescue IO::WaitReadable
+          break
+        end
+      end
+
+      if client[:buffer].bytesize > MAX_REQUEST_BYTES
+        send_error(sock, nil, -32600, "Request exceeds #{MAX_REQUEST_BYTES} bytes")
+        raise EOFError
+      end
+
+      loop do
+        request, consumed = take_json_prefix(client[:buffer])
+        break if consumed == 0
+        client[:buffer] = client[:buffer].byteslice(consumed..-1) || String.new
+        if request
+          handle_and_respond(sock, request)
+        else
+          log "JSON parse error"
+          send_error(sock, nil, -32700, "Parse error")
+        end
+      end
+    end
+
+    # Pull one complete JSON object off the front of +buffer+, returning
+    # [object, bytes_consumed].
+    #
+    # [nil, 0] means the buffer holds only part of a message and we should
+    # wait for the rest; [nil, n] means the first n bytes are a balanced but
+    # malformed object, which the caller drops so it cannot wedge the
+    # stream.
+    def take_json_prefix(buffer)
+      text = buffer.dup.force_encoding('UTF-8')
+      # A multi-byte character split across two reads.
+      return [nil, 0] unless text.valid_encoding?
+
+      first = text.index(/\S/)
+      return [nil, 0] if first.nil?
+
+      depth = 0
+      in_string = false
+      escape = false
+      i = first
+      while i < text.length
+        ch = text[i]
+        if in_string
+          if escape
+            escape = false
+          elsif ch == "\\"
+            escape = true
+          elsif ch == '"'
+            in_string = false
+          end
+        else
+          case ch
+          when '"' then in_string = true
+          when '{' then depth += 1
+          when '}'
+            depth -= 1
+            if depth <= 0
+              # Take any whitespace after the object too, so a stream of
+              # newline-terminated requests leaves the buffer empty.
+              last = i
+              last += 1 while last + 1 < text.length && text[last + 1] =~ /\s/
+              consumed = text[0..last].bytesize
+              begin
+                return [JSON.parse(text[first..i]), consumed]
+              rescue JSON::ParserError
+                return [nil, consumed]
+              end
+            end
+          end
+        end
+        i += 1
+      end
+      [nil, 0]
+    end
+
+    def handle_and_respond(sock, request)
+      request_id = request.is_a?(Hash) ? request["id"] : nil
+      begin
+        log "Processed request: #{request.inspect}"
+        response = handle_jsonrpc_request(request)
+        send_response(sock, response)
+      rescue StandardError => e
+        log "Request error: #{e.message}"
+        send_error(sock, request_id, -32603, e.message)
+      end
+    end
+
+    def send_response(sock, response)
+      body = response.to_json + "\n"
+      log "Sending response: #{body.strip}"
+      sock.write(body)
+      sock.flush
+      log "Response sent"
+    end
+
+    def send_error(sock, id, code, message)
+      body = {
+        :jsonrpc => "2.0",
+        :error => { :code => code, :message => message },
+        :id => id
+      }.to_json + "\n"
+      begin
+        sock.write(body)
+        sock.flush
+      rescue StandardError => e
+        log "Failed to send error response: #{e.message}"
       end
     end
 
@@ -138,6 +255,9 @@ module SU_MCP
         UI.stop_timer(@timer_id)
         @timer_id = nil
       end
+
+      @clients.each { |client| client[:sock].close rescue nil }
+      @clients.clear
       
       @server.close if @server
       @server = nil
