@@ -3,6 +3,7 @@ import socket
 import json
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -11,6 +12,15 @@ from typing import AsyncIterator, Dict, Any, List
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SketchupMCPServer")
+
+# Where the SketchUp extension is listening.
+#
+# Defaults to loopback, for SketchUp on this machine. If SketchUp runs in a VM,
+# point SKETCHUP_MCP_HOST at the guest (the forwarded address, or the guest IP
+# on a host-only/bridged network) and make sure the extension in the guest is
+# bound to something other than 127.0.0.1.
+SKETCHUP_HOST = os.environ.get("SKETCHUP_MCP_HOST", "localhost")
+SKETCHUP_PORT = int(os.environ.get("SKETCHUP_MCP_PORT", "9876"))
 
 # Define version directly to avoid pkg_resources dependency
 __version__ = "0.1.17"
@@ -261,7 +271,7 @@ def get_sketchup_connection():
     # socket now surfaces as a failed send or read in send_command, which
     # disconnects; the next call through here reconnects.
     if _sketchup_connection is None:
-        _sketchup_connection = SketchupConnection(host="localhost", port=9876)
+        _sketchup_connection = SketchupConnection(host=SKETCHUP_HOST, port=SKETCHUP_PORT)
 
     # connect() is a no-op when the socket is already open, and reconnects
     # when a previous call found it dead and dropped it.
@@ -269,9 +279,11 @@ def get_sketchup_connection():
         logger.error("Failed to connect to Sketchup")
         _sketchup_connection = None
         raise Exception(
-            "Could not connect to Sketchup at localhost:9876. "
+            f"Could not connect to Sketchup at {SKETCHUP_HOST}:{SKETCHUP_PORT}. "
             "Make sure the Sketchup extension is running (it starts with "
-            "Sketchup; Extensions > MCP Server > Start Server to retry)."
+            "Sketchup; Extensions > MCP Server > Start Server to retry), and "
+            "if Sketchup is in a VM, that SKETCHUP_MCP_HOST points at it and "
+            "the extension is bound to a non-loopback address."
         )
 
     return _sketchup_connection

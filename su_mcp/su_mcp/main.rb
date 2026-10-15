@@ -7,9 +7,20 @@ puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
 
 module SU_MCP
+  # Where the extension listens.
+  #
+  # The default is loopback only, which is right when SketchUp and the MCP
+  # server are on the same machine. If SketchUp runs in a VM and the MCP
+  # server runs on the host, set SKETCHUP_MCP_BIND to '0.0.0.0' so the
+  # forwarded or routed connection can actually arrive - a listener on
+  # 127.0.0.1 will not see it. There is no authentication on this port and
+  # no approval prompt: anything that can route to it can run Ruby here.
+  BIND_ADDRESS = ENV['SKETCHUP_MCP_BIND'] || '127.0.0.1'
+  PORT = (ENV['SKETCHUP_MCP_PORT'] || 9876).to_i
+
   class Server
     def initialize
-      @port = 9876
+      @port = PORT
       @server = nil
       @running = false
       @timer_id = nil
@@ -48,10 +59,10 @@ module SU_MCP
       return if @running
       
       begin
-        log "Starting server on localhost:#{@port}..."
+        log "Starting server on #{BIND_ADDRESS}:#{@port}..."
         
-        @server = TCPServer.new('127.0.0.1', @port)
-        log "Server created on port #{@port}"
+        @server = TCPServer.new(BIND_ADDRESS, @port)
+        log "Server created on #{BIND_ADDRESS}:#{@port}"
         
         @running = true
         

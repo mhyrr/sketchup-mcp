@@ -43,6 +43,25 @@ We're using uv so you'll need to ```brew install uv```
    Extensions > MCP Server > Start Server to retry.
 2. Make sure the MCP server is running in your terminal
 
+### Connecting across a VM
+
+The extension listens on `127.0.0.1:9876` by default, and the MCP server
+connects to `localhost:9876`. If SketchUp runs in a VM and Claude runs on the
+host, loopback will not work in either direction:
+
+1. In the guest, set `SKETCHUP_MCP_BIND` to `0.0.0.0` (for example
+   `setx SKETCHUP_MCP_BIND 0.0.0.0`, then restart SketchUp) so the incoming
+   connection can arrive at all.
+2. On the host, set `SKETCHUP_MCP_HOST` in the Claude config's `env` to the
+   guest's address - `localhost` with VirtualBox NAT port forwarding, or the
+   guest IP on a host-only or bridged network. `SKETCHUP_MCP_PORT` moves the
+   port, and has to be set on both sides.
+
+There is no authentication on that port and no approval prompt before
+`eval_ruby` runs, so binding to `0.0.0.0` lets anything that can reach the
+guest run Ruby in SketchUp. Only do it when the VM is disposable and the
+network it sits on is one you trust.
+
 ### Using with Claude
 
 Configure Claude to use the MCP server by adding the following to your Claude configuration:
