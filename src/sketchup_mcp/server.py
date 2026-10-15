@@ -142,8 +142,20 @@ class SketchupConnection:
             j += 1
         return None, 0
 
-    def send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
-        """Send a JSON-RPC request to Sketchup and return the response"""
+    def send_command(
+        self,
+        method: str,
+        params: Dict[str, Any] = None,
+        request_id: Any = None,
+        timeout: float = 15.0,
+        retries: int = 2
+    ) -> Dict[str, Any]:
+        """Send a JSON-RPC request to Sketchup and return the response
+
+        timeout/retries are per call: eval_ruby can run for a long time and
+        is not safe to repeat, so it needs a long timeout and no automatic
+        retry (a retry after a timeout runs the same code a second time).
+        """
         # Try to connect if not connected
         if not self.connect():
             raise ConnectionError("Not connected to Sketchup")
@@ -176,7 +188,7 @@ class SketchupConnection:
             }
         
         # Maximum number of retries
-        max_retries = 2
+        max_retries = retries
         retry_count = 0
         
         while retry_count <= max_retries:
@@ -188,11 +200,11 @@ class SketchupConnection:
                 logger.info(f"Raw bytes being sent: {request_bytes}")
                 
                 self.sock.sendall(request_bytes)
-                logger.info(f"Request sent, waiting for response...")
+                logger.info(f"Request sent, waiting up to {timeout}s for response...")
                 
-                self.sock.settimeout(15.0)
+                self.sock.settimeout(timeout)
                 
-                response = self.receive_response(timeout=15.0)
+                response = self.receive_response(timeout=timeout)
                 logger.info(f"Response parsed: {response}")
 
                 if not isinstance(response, dict):
@@ -593,7 +605,12 @@ def eval_ruby(
                     "code": code
                 }
             },
-            request_id=ctx.request_id
+            request_id=ctx.request_id,
+            # Ruby can take a while on a big model, and it is not idempotent:
+            # a timeout does not mean it failed, so retrying would run it
+            # again. Wait long and never retry.
+            timeout=600.0,
+            retries=0
         )
         
         logger.info(f"eval_ruby result: {result}")
