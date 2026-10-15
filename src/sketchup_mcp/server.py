@@ -22,6 +22,16 @@ logger = logging.getLogger("SketchupMCPServer")
 SKETCHUP_HOST = os.environ.get("SKETCHUP_MCP_HOST", "localhost")
 SKETCHUP_PORT = int(os.environ.get("SKETCHUP_MCP_PORT", "9876"))
 
+# How long eval_ruby waits for SketchUp before giving up.
+#
+# Keep this under the MCP client's own request timeout (60s in the reference
+# SDKs). FastMCP runs these synchronous tools on its event loop, so while one
+# call is waiting here the whole server is frozen. If the client gives up
+# first, every call behind this one times out too, which reads as if SketchUp
+# had stopped answering. Giving up here first returns a real error and frees
+# the server for the next call.
+EVAL_TIMEOUT = float(os.environ.get("SKETCHUP_MCP_EVAL_TIMEOUT", "50"))
+
 # Define version directly to avoid pkg_resources dependency
 __version__ = "0.1.17"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
@@ -47,14 +57,18 @@ class SketchupConnection:
     def connect(self) -> bool:
         """Connect to the Sketchup extension socket server
 
-        An already-open socket is reused as-is. There is no liveness probe:
-        a probe that writes cannot tell a live peer from one that has sent
-        FIN - the local send succeeds either way - so it only reports false
-        health. If the peer really has gone away, the send or the read in
-        send_command fails and that is where we reconnect.
+        An open socket is reused unless a peek shows the extension has hung
+        up on it (see _peer_closed). Without that check, the first call after
+        SketchUp restarts goes down the dead socket and fails with WinError
+        10053, and only the call after it reconnects. That failure cannot
+        simply be retried for eval_ruby, since it can't be told apart from
+        one where the code did run, so it has to be caught before sending.
         """
         if self.sock:
-            return True
+            if not self._peer_closed():
+                return True
+            logger.info("Sketchup closed the connection; reconnecting")
+            self.disconnect()
 
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -67,6 +81,32 @@ class SketchupConnection:
             self.sock = None
             return False
     
+    def _peer_closed(self) -> bool:
+        """Whether the cached socket is no use for a new request
+
+        A non-blocking peek, which unlike a zero-byte send does see the
+        peer's FIN (recv returns b"") or RST (recv raises). Any bytes waiting
+        before we have sent anything also count: they are a reply nobody is
+        waiting for, and reading them as the next response would put every
+        later call one reply out of step.
+        """
+        if self.buffer:
+            return True
+        previous = self.sock.gettimeout()
+        try:
+            self.sock.setblocking(False)
+            self.sock.recv(1, socket.MSG_PEEK)
+            return True
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+        finally:
+            try:
+                self.sock.settimeout(previous)
+            except OSError:
+                pass
+
     def disconnect(self):
         """Disconnect from the Sketchup extension"""
         if self.sock:
@@ -241,6 +281,13 @@ class SketchupConnection:
                 else:
                     logger.error(f"Max retries reached, giving up")
                     self.disconnect()
+                    if isinstance(e, socket.timeout):
+                        raise Exception(
+                            f"No response from Sketchup within {timeout:g}s. The "
+                            "request may still be running there; it was not "
+                            "sent again. Check the Ruby Console for the last "
+                            "'Request #N started' without a 'finished'."
+                        )
                     raise Exception(f"Connection to Sketchup lost after {max_retries+1} attempts: {str(e)}")
             
             except SketchupRubyError:
@@ -618,10 +665,10 @@ def eval_ruby(
                 }
             },
             request_id=ctx.request_id,
-            # Ruby can take a while on a big model, and it is not idempotent:
-            # a timeout does not mean it failed, so retrying would run it
-            # again. Wait long and never retry.
-            timeout=600.0,
+            # Ruby is not idempotent: a timeout does not mean it failed, so
+            # retrying would run it again. Never retry, and see EVAL_TIMEOUT
+            # for why the wait is bounded by the client's timeout.
+            timeout=EVAL_TIMEOUT,
             retries=0
         )
         

@@ -62,6 +62,20 @@ There is no authentication on that port and no approval prompt before
 guest run Ruby in SketchUp. Only do it when the VM is disposable and the
 network it sits on is one you trust.
 
+### When it stops answering
+
+Every request is logged to the Ruby Console as `Request #N started` and
+`Request #N finished` (or `failed`). If calls start timing out, the last
+`started` with no matching end is the one that never came back. **Extensions >
+MCP Server > Show Status** prints the connected clients, the requests still in
+flight, and when the server last serviced its sockets.
+
+A request that never returns no longer blocks the others, and a watchdog
+restarts the server's timer if it stops firing. `eval_ruby` gives up after 50
+seconds, so it answers before the MCP client's own timeout does.
+`SKETCHUP_MCP_EVAL_TIMEOUT` on the host changes that; keep it under the
+client's limit.
+
 ### Using with Claude
 
 Configure Claude to use the MCP server by adding the following to your Claude configuration:

@@ -24,10 +24,20 @@ module SU_MCP
       @server = nil
       @running = false
       @timer_id = nil
-      @in_tick = false
-      # Accepted clients, kept across timer ticks: { :sock, :buffer, :id }
+      @watchdog_id = nil
+      # How many ticks are on the stack right now. More than one means a
+      # request is suspended in a nested event loop and the timer fired again
+      # underneath it.
+      @tick_depth = 0
+      @last_tick_at = Time.now
+      # Accepted clients, kept across timer ticks:
+      # { :sock, :buffer, :id, :busy }
       @clients = []
       @next_client_id = 1
+      # Requests currently being handled, by sequence number, so the watchdog
+      # and the status menu can say which one is stuck.
+      @in_flight = {}
+      @next_request_no = 1
       
       # Try multiple ways to show console
       begin
@@ -55,6 +65,17 @@ module SU_MCP
     READ_CHUNK        = 16384
     MAX_REQUEST_BYTES = 8 * 1024 * 1024
 
+    TICK_INTERVAL = 0.1
+    # The watchdog restarts the tick timer if it has been silent this long,
+    # and names any request that has been running longer than SLOW_REQUEST.
+    WATCHDOG_INTERVAL = 5
+    TICK_STALL        = 3
+    SLOW_REQUEST      = 30
+    # Nested ticks are allowed so a suspended request cannot starve the
+    # others, but not without bound.
+    MAX_TICK_DEPTH = 4
+    MAX_LOG_CHARS  = 500
+
     def start
       return if @running
       
@@ -66,7 +87,8 @@ module SU_MCP
         
         @running = true
         
-        @timer_id = UI.start_timer(0.1, true) { tick }
+        start_tick_timer
+        @watchdog_id = UI.start_timer(WATCHDOG_INTERVAL, true) { watchdog }
         
         log "Server started and listening"
         
@@ -75,6 +97,15 @@ module SU_MCP
         log e.backtrace.join("\n")
         stop
       end
+    end
+
+    # (Re)start the timer that drives tick. Stopping an id that is already
+    # dead is harmless, so the watchdog can call this without knowing why the
+    # old timer went quiet.
+    def start_tick_timer
+      UI.stop_timer(@timer_id) if @timer_id
+      @last_tick_at = Time.now
+      @timer_id = UI.start_timer(TICK_INTERVAL, true) { tick }
     end
 
     # One pass of the timer: take any new connections, then service the ones
@@ -87,23 +118,77 @@ module SU_MCP
     # write succeeds locally and the next read returns EOF, which is why
     # every second eval_ruby failed with "Connection closed before receiving
     # any data".
+    #
+    # Nothing may escape this method. An exception out of a timer block can
+    # leave SketchUp's timer dead while the rest of SketchUp carries on,
+    # which looks exactly like a server that has gone quiet: responsive
+    # window, port still listening, closed clients piling up in CLOSE_WAIT.
+    # Hence Exception rather than StandardError - eval'd code can raise
+    # SyntaxError, SystemStackError, SystemExit or a test framework's
+    # assertion, none of which are StandardErrors.
     def tick
       return unless @running
-      # A blocking approval dialog pumps the event loop, so the timer can
-      # fire again while we are inside a request. Re-entering here would
-      # read from a client's socket underneath the call that is mid-flight
-      # and scramble its buffer.
-      return if @in_tick
-      @in_tick = true
+      @last_tick_at = Time.now
+      # Code run by a request can pump the event loop (a dialog, a progress
+      # UI, anything modal), and SketchUp then fires this timer again while
+      # that request is still on the stack. That used to be refused outright,
+      # so a request that never came back out of its nested loop silenced
+      # the server for good. Now the nested tick runs, and only the client
+      # whose request is suspended is left alone (see :busy).
+      return if @tick_depth >= MAX_TICK_DEPTH
+      @tick_depth += 1
       begin
         accept_new_connections
         service_clients
       ensure
-        @in_tick = false
+        @tick_depth -= 1
+        @last_tick_at = Time.now
       end
-    rescue StandardError => e
-      log "Timer error: #{e.message}"
-      log e.backtrace.join("\n")
+    rescue Exception => e
+      log_exception("Timer error", e)
+    end
+
+    # Runs on its own timer. Restarts the tick timer if it has stopped
+    # firing, and names requests that have been running a long time, so the
+    # Ruby Console shows which request a hang started on.
+    def watchdog
+      return unless @running
+      now = Time.now
+
+      silent_for = now - @last_tick_at
+      if silent_for > TICK_STALL
+        # Both timers are serviced by the same event loop, so this one
+        # firing while tick has not means tick's timer is gone, not that the
+        # main thread is busy.
+        log "WATCHDOG: tick timer silent for #{silent_for.round(1)}s " \
+            "(depth #{@tick_depth}); restarting it."
+        log_in_flight
+        start_tick_timer
+      end
+
+      @in_flight.each_value do |req|
+        age = now - req[:started]
+        next if age < SLOW_REQUEST || req[:warned]
+        req[:warned] = true
+        log "WATCHDOG: request ##{req[:no]} (#{req[:label]}) still running " \
+            "after #{age.round}s. It has not returned to the server; other " \
+            "clients are still being served."
+      end
+    rescue Exception => e
+      log_exception("Watchdog error", e)
+    end
+
+    def status
+      lines = []
+      lines << "running: #{@running}, listening on #{BIND_ADDRESS}:#{@port}"
+      lines << "last tick: #{(Time.now - @last_tick_at).round(1)}s ago, depth #{@tick_depth}"
+      lines << "clients: " + (@clients.empty? ? "none" : @clients.map { |c|
+        "##{c[:id]}#{c[:busy] ? ' (busy)' : ''}"
+      }.join(", "))
+      lines << "in flight: " + (@in_flight.empty? ? "none" : @in_flight.values.map { |r|
+        "##{r[:no]} #{r[:label]} for #{(Time.now - r[:started]).round(1)}s"
+      }.join("; "))
+      lines.each { |l| log "STATUS: #{l}" }
     end
 
     def accept_new_connections
@@ -114,27 +199,63 @@ module SU_MCP
         rescue IO::WaitReadable
           break
         end
-        @clients << { :sock => sock, :buffer => String.new, :id => @next_client_id }
+        @clients << { :sock => sock, :buffer => String.new, :id => @next_client_id, :busy => false }
         log "Client ##{@next_client_id} connected"
         @next_client_id += 1
       end
     end
 
+    # Iterates over a copy: a nested tick, or a request that stops the
+    # server, can change @clients while we are in the middle of it.
     def service_clients
-      @clients.reject! do |client|
+      @clients.dup.each do |client|
+        next unless @clients.include?(client)
         begin
-          drain_client(client)
-          false
-        rescue EOFError, Errno::ECONNRESET, Errno::EPIPE
-          log "Client ##{client[:id]} disconnected"
-          client[:sock].close rescue nil
-          true
+          if client[:busy]
+            # Its request is suspended further up the stack. Reading now
+            # would take bytes out from under it, but a peek is safe, and a
+            # client that has hung up can be let go instead of sitting in
+            # CLOSE_WAIT until the request comes back (if it ever does).
+            drop_client(client, "hung up while its request was still running") if peer_closed?(client[:sock])
+          else
+            drain_client(client)
+          end
+        rescue EOFError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE, IOError
+          drop_client(client, "disconnected")
         rescue StandardError => e
-          log "Client ##{client[:id]} error: #{e.message}"
-          client[:sock].close rescue nil
-          true
+          drop_client(client, "error: #{e.class}: #{e.message}")
         end
       end
+    end
+
+    def peer_closed?(sock)
+      sock.recv_nonblock(1, Socket::MSG_PEEK).empty?
+    rescue IO::WaitReadable
+      false
+    end
+
+    def drop_client(client, why)
+      log "Client ##{client[:id]} #{why}"
+      client[:sock].close rescue nil
+      @clients.delete(client)
+    end
+
+    def log_exception(context, e)
+      log "#{context}: #{e.class}: #{e.message}"
+      log e.backtrace.first(15).join("\n") if e.backtrace
+    rescue Exception
+      nil
+    end
+
+    def log_in_flight
+      return if @in_flight.empty?
+      @in_flight.each_value do |r|
+        log "  in flight: ##{r[:no]} #{r[:label]} for #{(Time.now - r[:started]).round(1)}s"
+      end
+    end
+
+    def truncate(text)
+      text.length > MAX_LOG_CHARS ? "#{text[0, MAX_LOG_CHARS]}... (#{text.length} chars)" : text
     end
 
     # Read whatever bytes are waiting, then dispatch every complete JSON
@@ -162,9 +283,16 @@ module SU_MCP
         break if consumed == 0
         client[:buffer] = client[:buffer].byteslice(consumed..-1) || String.new
         if request
-          handle_and_respond(sock, request)
+          client[:busy] = true
+          begin
+            handle_and_respond(client, request)
+          ensure
+            client[:busy] = false
+          end
+          # A nested tick may have let this client go while its request ran.
+          break unless @clients.include?(client)
         else
-          log "JSON parse error"
+          log "Client ##{client[:id]}: JSON parse error"
           send_error(sock, nil, -32700, "Parse error")
         end
       end
@@ -224,21 +352,53 @@ module SU_MCP
       [nil, 0]
     end
 
-    def handle_and_respond(sock, request)
+    # Every request gets a sequence number and a start and an end line in the
+    # Ruby Console, so if the server does go quiet the last "started" with no
+    # matching "finished" is the request it stopped on.
+    #
+    # Rescues Exception, not StandardError: whatever eval'd code throws is
+    # answered as an error on this request and goes no further.
+    def handle_and_respond(client, request)
+      sock = client[:sock]
       request_id = request.is_a?(Hash) ? request["id"] : nil
+      no = @next_request_no
+      @next_request_no += 1
+      label = request_label(request)
+      started = Time.now
+      @in_flight[no] = { :no => no, :label => label, :started => started, :warned => false }
+      log "Request ##{no} started (client ##{client[:id]}, id #{request_id.inspect}): #{label}"
+
       begin
-        log "Processed request: #{request.inspect}"
         response = handle_jsonrpc_request(request)
         send_response(sock, response)
-      rescue StandardError => e
-        log "Request error: #{e.message}"
-        send_error(sock, request_id, -32603, e.message)
+        log "Request ##{no} finished in #{(Time.now - started).round(2)}s"
+      rescue Exception => e
+        log "Request ##{no} failed after #{(Time.now - started).round(2)}s"
+        log_exception("Request ##{no} error", e)
+        send_error(sock, request_id, -32603, "#{e.class}: #{e.message}")
+      ensure
+        @in_flight.delete(no)
       end
+    end
+
+    def request_label(request)
+      return request.class.name unless request.is_a?(Hash)
+      params = request["params"].is_a?(Hash) ? request["params"] : {}
+      name = params["name"] || request["command"]
+      label = [request["method"], name].compact.join(" ")
+      args = params["arguments"]
+      if name == "eval_ruby" && args.is_a?(Hash) && args["code"].is_a?(String)
+        first_line = args["code"].strip.lines.first.to_s.strip
+        label += " (#{args['code'].length} chars: #{first_line[0, 60].inspect})"
+      end
+      label
+    rescue StandardError
+      "unknown request"
     end
 
     def send_response(sock, response)
       body = response.to_json + "\n"
-      log "Sending response: #{body.strip}"
+      log "Sending response: #{truncate(body.strip)}"
       sock.write(body)
       sock.flush
       log "Response sent"
@@ -267,6 +427,11 @@ module SU_MCP
         @timer_id = nil
       end
 
+      if @watchdog_id
+        UI.stop_timer(@watchdog_id)
+        @watchdog_id = nil
+      end
+
       @clients.each { |client| client[:sock].close rescue nil }
       @clients.clear
       
@@ -278,7 +443,7 @@ module SU_MCP
     private
 
     def handle_jsonrpc_request(request)
-      log "Handling JSONRPC request: #{request.inspect}"
+      log "Handling JSONRPC request: #{truncate(request.inspect)}"
       
       # Handle direct command format (for backward compatibility)
       if request["command"]
@@ -291,7 +456,7 @@ module SU_MCP
           "jsonrpc" => request["jsonrpc"] || "2.0",
           "id" => request["id"]
         }
-        log "Converting to tool request: #{tool_request.inspect}"
+        log "Converting to tool request: #{truncate(tool_request.inspect)}"
         return handle_tool_call(tool_request)
       end
 
@@ -343,7 +508,7 @@ module SU_MCP
     end
 
     def handle_tool_call(request)
-      log "Handling tool call: #{request.inspect}"
+      log "Handling tool call: #{truncate(request.inspect)}"
       tool_name = request["params"]["name"]
       args = request["params"]["arguments"]
 
@@ -379,7 +544,7 @@ module SU_MCP
           raise "Unknown tool: #{tool_name}"
         end
 
-        log "Tool call result: #{result.inspect}"
+        log "Tool call result: #{truncate(result.inspect)}"
         if result[:success]
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
@@ -391,7 +556,7 @@ module SU_MCP
             },
             id: request["id"]
           }
-          log "Sending success response: #{response.inspect}"
+          log "Sending success response: #{truncate(response.inspect)}"
           response
         else
           response = {
@@ -403,7 +568,7 @@ module SU_MCP
             },
             id: request["id"]
           }
-          log "Sending error response: #{response.inspect}"
+          log "Sending error response: #{truncate(response.inspect)}"
           response
         end
       rescue StandardError => e
@@ -417,7 +582,7 @@ module SU_MCP
           },
           id: request["id"]
         }
-        log "Sending error response: #{response.inspect}"
+        log "Sending error response: #{truncate(response.inspect)}"
         response
       end
     end
@@ -1964,17 +2129,20 @@ module SU_MCP
         # Evaluate the Ruby code
         log "Starting code evaluation..."
         result = eval(params["code"], binding)
-        log "Code evaluation completed with result: #{result.inspect}"
+        log "Code evaluation completed with result: #{truncate(result.inspect)}"
         
         # Return success with the result as a string
         { 
           success: true,
           result: result.to_s
         }
-      rescue StandardError => e
-        log "Error in eval_ruby: #{e.message}"
-        log e.backtrace.join("\n")
-        raise "Ruby evaluation error: #{e.message}"
+      rescue Exception => e
+        # Exception, not StandardError: a syntax error in the snippet, a
+        # stack overflow, a test assertion or an `exit` all belong to this
+        # request and must come back as its error, not escape the timer.
+        log "Error in eval_ruby: #{e.class}: #{e.message}"
+        log e.backtrace.first(15).join("\n") if e.backtrace
+        raise "Ruby evaluation error: #{e.class}: #{e.message}"
       end
     end
   end
@@ -1985,6 +2153,7 @@ module SU_MCP
     menu = UI.menu("Plugins").add_submenu("MCP Server")
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
+    menu.add_item("Show Status") { @server.status }
 
     # Start listening as soon as SketchUp loads the extension, so there is no
     # menu trip before Claude can connect. start logs and cleans up on its own
