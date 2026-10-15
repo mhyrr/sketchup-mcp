@@ -1854,7 +1854,12 @@ module SU_MCP
     menu = UI.menu("Plugins").add_submenu("MCP Server")
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
-    
+
+    # Start listening as soon as SketchUp loads the extension, so there is no
+    # menu trip before Claude can connect. start logs and cleans up on its own
+    # if the port is taken, and Start Server from the menu still works after.
+    @server.start
+
     file_loaded(__FILE__)
   end
 end 

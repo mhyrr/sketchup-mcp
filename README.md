@@ -37,9 +37,11 @@ We're using uv so you'll need to ```brew install uv```
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
-2. The server will start on the default port (9876)
-3. Make sure the MCP server is running in your terminal
+1. Start Sketchup. The extension starts its server automatically on the
+   default port (9876); check the Ruby Console for "Server started and
+   listening". If it failed (for example, the port was in use), use
+   Extensions > MCP Server > Start Server to retry.
+2. Make sure the MCP server is running in your terminal
 
 ### Using with Claude
 
