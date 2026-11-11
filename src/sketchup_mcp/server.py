@@ -1,4 +1,10 @@
-from mcp.server.fastmcp import FastMCP, Context
+try:
+    from mcp.server.fastmcp import FastMCP, Context
+except ImportError:
+    try:
+        from fastmcp import FastMCP, Context
+    except ImportError:
+        from mcp.server.mcpserver import MCPServer as FastMCP, Context
 import socket
 import json
 import asyncio
